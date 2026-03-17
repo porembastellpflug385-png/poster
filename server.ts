@@ -8,6 +8,8 @@ const port = Number(process.env.PORT || 3001);
 const BASE_URL = process.env.POSTER_API_BASE_URL || "https://ai.scd666.com";
 const API_KEY = process.env.POSTER_API_KEY || "";
 const TEXT_MODEL = process.env.POSTER_TEXT_MODEL || "deepseek-v3.2-exp";
+const DEFAULT_IDEA_COUNT = Number(process.env.POSTER_IDEA_COUNT || 6);
+const DEFAULT_IMAGE_COUNT = Number(process.env.POSTER_IMAGE_COUNT || 3);
 
 const MODEL_ENDPOINT_MAP: Record<string, { type: string; endpoint: string }> = {
   "gemini-3.1-flash-image-preview": { type: "openai_chat", endpoint: "/v1/chat/completions" },
@@ -85,7 +87,9 @@ type CreateIdeasPayload = {
   prompt: string;
   selectedStyle: string;
   selectedRatio: string;
-  styleRefImg: UploadAsset | null;
+  styleRefImages: UploadAsset[];
+  selectedTextModel?: string;
+  ideaCount?: number;
 };
 
 type GeneratePostersPayload = {
@@ -94,14 +98,16 @@ type GeneratePostersPayload = {
   selectedStyle: string;
   selectedRatio: string;
   selectedModel: string;
+  imageCount?: number;
 };
 
 type OptimizeExistingPayload = {
-  uploadedPoster: UploadAsset | null;
+  uploadedPosters: UploadAsset[];
   optimizeFeedback: string;
   selectedStyle: string;
   selectedRatio: string;
   selectedModel: string;
+  imageCount?: number;
 };
 
 type OptimizePosterPayload = {
@@ -111,6 +117,7 @@ type OptimizePosterPayload = {
   selectedStyle: string;
   selectedRatio: string;
   selectedModel: string;
+  imageCount?: number;
 };
 
 type GenerateProposalPayload = {
@@ -148,13 +155,16 @@ async function callOpenAIChat(messages: any[], model: string, extra: any = {}) {
       const data = await res.json();
       if (data.error?.message) message = data.error.message;
     } catch {}
+    if (res.status === 404) {
+      message = `模型或接口不存在: ${model} -> ${ep}`;
+    }
     throw new Error(message);
   }
   return res.json();
 }
 
-async function callTextModel(messages: any[], extra: any = {}) {
-  return callOpenAIChat(messages, TEXT_MODEL, extra);
+async function callTextModel(messages: any[], model = TEXT_MODEL, extra: any = {}) {
+  return callOpenAIChat(messages, model, extra);
 }
 
 async function callFlux(prompt: string, model: string, ratio: string): Promise<string> {
@@ -170,6 +180,9 @@ async function callFlux(prompt: string, model: string, ratio: string): Promise<s
       const data = await res.json();
       if (data.error?.message) message = data.error.message;
     } catch {}
+    if (res.status === 404) {
+      message = `Flux 接口不存在或模型不可用: ${model}`;
+    }
     throw new Error(message);
   }
   const data = await res.json();
@@ -209,6 +222,9 @@ async function callMJ(model: string, prompt: string, ratio: string, base64Images
       const data = await submitRes.json();
       message = data.description || data.error?.message || message;
     } catch {}
+    if (submitRes.status === 404) {
+      message = `MJ 接口不存在或模型不可用: ${model}`;
+    }
     throw new Error(message);
   }
   const submitData = await submitRes.json();
@@ -288,43 +304,48 @@ function updateTask(taskId: string, patch: Partial<TaskRecord>) {
 }
 
 async function runCreateIdeasTask(payload: CreateIdeasPayload) {
-  if (!payload.prompt.trim() && !payload.styleRefImg) {
+  if (!payload.prompt.trim() && !payload.styleRefImages?.length) {
     throw new Error("请输入需求或上传参考图");
   }
+  const ideaCount = [2, 4, 6].includes(payload.ideaCount || 0) ? payload.ideaCount! : DEFAULT_IDEA_COUNT;
   const content: any[] = [
     {
       type: "text",
-      text: `你是一位顶尖海报设计创意总监。生成6个完全不同的创意提示词（英文prompt），详细描述海报视觉内容、构图、氛围。
+      text: `你是一位顶尖海报设计创意总监。生成${ideaCount}个完全不同的创意提示词（英文prompt），详细描述海报视觉内容、构图、氛围。
 需求: "${payload.prompt}"
 美术风格: ${payload.selectedStyle}
 画幅: ${payload.selectedRatio}
-${payload.selectedStyle === "smart" && payload.styleRefImg ? "根据参考图风格决定方向。" : ""}
-严格返回JSON: {"ideas": ["p1","p2","p3","p4","p5","p6"]}`,
+${payload.selectedStyle === "smart" && payload.styleRefImages?.length ? "根据参考图风格决定方向。" : ""}
+如果用户在需求中使用@图N，请把对应参考图一起纳入理解。
+严格返回JSON: {"ideas": ["p1","p2"]}`,
     },
   ];
-  if (payload.styleRefImg) {
+  payload.styleRefImages?.forEach((img) => {
     content.push({
       type: "image_url",
-      image_url: { url: `data:${payload.styleRefImg.mimeType};base64,${payload.styleRefImg.data}` },
+      image_url: { url: `data:${img.mimeType};base64,${img.data}` },
     });
-  }
-  const res = await callTextModel([{ role: "user", content }], { response_format: { type: "json_object" } });
+  });
+  const res = await callTextModel([{ role: "user", content }], payload.selectedTextModel || TEXT_MODEL, {
+    response_format: { type: "json_object" },
+  });
   const parsed = JSON.parse(res.choices?.[0]?.message?.content || "{}");
   const ideas = parsed.ideas || (Object.values(parsed).find(Array.isArray) as string[]) || [];
-  while (ideas.length < 6) {
+  while (ideas.length < ideaCount) {
     ideas.push("Creative poster design with unique artistic composition and bold visual impact");
   }
-  return { ideas: ideas.slice(0, 6) };
+  return { ideas: ideas.slice(0, ideaCount) };
 }
 
 async function runGeneratePostersTask(payload: GeneratePostersPayload) {
   if (!payload.selectedIdeas.length) throw new Error("请选择创意");
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const posters: PosterResult[] = [];
   for (const idx of payload.selectedIdeas) {
     const idea = payload.ideas[idx];
     const variants = await Promise.all(
-      [1, 2, 3].map((version) =>
+      Array.from({ length: imageCount }, (_, i) => i + 1).map((version) =>
         generateImage(
           `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. High quality poster. Variation ${version}.`,
           payload.selectedModel,
@@ -345,18 +366,19 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
 }
 
 async function runOptimizeExistingTask(payload: OptimizeExistingPayload) {
-  if (!payload.uploadedPoster) throw new Error("请上传海报");
+  if (!payload.uploadedPosters?.length) throw new Error("请上传海报");
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
-  const imageUrl = `data:${payload.uploadedPoster.mimeType};base64,${payload.uploadedPoster.data}`;
+  const imageUrls = payload.uploadedPosters.map((img) => `data:${img.mimeType};base64,${img.data}`);
+  const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const results = await Promise.all(
-    [1, 2, 3].map((version) =>
+    Array.from({ length: imageCount }, (_, i) => i + 1).map((version) =>
       generateImage(
         `Redesign and optimize this poster. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${
           payload.optimizeFeedback || "Make it more professional and visually striking."
         } Variation ${version}.`,
         payload.selectedModel,
         payload.selectedRatio,
-        [imageUrl],
+        imageUrls,
       ),
     ),
   );
@@ -374,6 +396,7 @@ async function runOptimizePosterTask(payload: OptimizePosterPayload) {
   if (!payload.activePoster) throw new Error("请选择海报");
   if (!payload.feedbackText.trim()) throw new Error("请输入反馈");
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const referenced: UploadAsset[] = [];
   const regex = /@图\s*(\d+)/g;
   let matched;
@@ -384,7 +407,9 @@ async function runOptimizePosterTask(payload: OptimizePosterPayload) {
   const imageUrls = [payload.activePoster.url, ...referenced.map((img) => `data:${img.mimeType};base64,${img.data}`)];
   const basePrompt = `Optimize this poster: "${payload.feedbackText}". ${stylePrompt} Ratio: ${payload.selectedRatio}. Apply changes.`;
   const results = await Promise.all(
-    [1, 2, 3].map((version) => generateImage(`${basePrompt} Variation ${version}.`, payload.selectedModel, payload.selectedRatio, imageUrls)),
+    Array.from({ length: imageCount }, (_, i) => i + 1).map((version) =>
+      generateImage(`${basePrompt} Variation ${version}.`, payload.selectedModel, payload.selectedRatio, imageUrls),
+    ),
   );
   return {
     posters: results.map((url, index) => ({

@@ -34,6 +34,11 @@ const IMAGE_MODELS = [
   { id: "flux-pro", label: "Flux Pro", tag: "稳定" },
   { id: "flux-1.1-pro", label: "Flux 1.1 Pro", tag: "精细" },
 ];
+const TEXT_MODELS = [
+  { id: "deepseek-v3.2-exp", label: "DeepSeek V3.2", tag: "稳定" },
+  { id: "gpt-4.1-mini", label: "GPT-4.1 mini", tag: "快速" },
+  { id: "gpt-4.1", label: "GPT-4.1", tag: "高质量" },
+];
 
 const ART_STYLES = [
   { id: "photography", label: "摄影海报", icon: Camera, desc: "真实摄影质感" },
@@ -69,6 +74,8 @@ const QUICK_FEEDBACK_CHIPS = [
   "构图更简洁，留白更多",
   "更适合社交媒体传播",
 ];
+const IDEA_COUNT_OPTIONS = [2, 4, 6] as const;
+const IMAGE_COUNT_OPTIONS = [1, 2, 3] as const;
 
 type UploadAsset = {
   id?: string;
@@ -313,11 +320,15 @@ export default function App() {
   const [error, setError] = useState("");
 
   const [selectedModel, setSelectedModel] = useState(IMAGE_MODELS[0].id);
+  const [selectedTextModel, setSelectedTextModel] = useState(TEXT_MODELS[0].id);
   const [selectedStyle, setSelectedStyle] = useState("photography");
   const [selectedRatio, setSelectedRatio] = useState("1:1");
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [showTextModelPicker, setShowTextModelPicker] = useState(false);
   const [activeTemplateId, setActiveTemplateId] = useState<string | null>(null);
   const [taskStatus, setTaskStatus] = useState<"idle" | "queued" | "running" | "completed" | "failed">("idle");
+  const [ideaCount, setIdeaCount] = useState<(typeof IDEA_COUNT_OPTIONS)[number]>(6);
+  const [imageCount, setImageCount] = useState<(typeof IMAGE_COUNT_OPTIONS)[number]>(3);
 
   const [briefFields, setBriefFields] = useState<Record<BriefFieldKey, string>>({
     subject: "",
@@ -326,10 +337,10 @@ export default function App() {
     tone: "",
   });
   const [prompt, setPrompt] = useState("");
-  const [styleRefImg, setStyleRefImg] = useState<UploadAsset | null>(null);
+  const [styleRefImages, setStyleRefImages] = useState<UploadAsset[]>([]);
   const styleRefInputRef = useRef<HTMLInputElement>(null);
 
-  const [uploadedPoster, setUploadedPoster] = useState<UploadAsset | null>(null);
+  const [uploadedPosters, setUploadedPosters] = useState<UploadAsset[]>([]);
   const [optimizeFeedback, setOptimizeFeedback] = useState("");
   const uploadPosterRef = useRef<HTMLInputElement>(null);
 
@@ -376,30 +387,16 @@ export default function App() {
     return item;
   }, []);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>, setter: (asset: UploadAsset) => void) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const result = reader.result as string;
-      setter({
-        mimeType: file.type,
-        data: result.split(",")[1],
-        url: result,
-        name: file.name,
-      });
-    };
-    reader.readAsDataURL(file);
-    e.target.value = "";
-  };
-
-  const handleMultiFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleMultiAssetUpload = (
+    e: React.ChangeEvent<HTMLInputElement>,
+    setter: React.Dispatch<React.SetStateAction<UploadAsset[]>>,
+  ) => {
     const files = e.target.files ? Array.from<File>(e.target.files) : [];
     files.forEach((file) => {
       const reader = new FileReader();
       reader.onloadend = () => {
         const result = reader.result as string;
-        setRefImages((prev) => [
+        setter((prev) => [
           ...prev,
           {
             id: Date.now().toString() + Math.random().toString(36).slice(2),
@@ -413,6 +410,10 @@ export default function App() {
       reader.readAsDataURL(file);
     });
     e.target.value = "";
+  };
+
+  const handleMultiFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    handleMultiAssetUpload(e, setRefImages);
   };
 
   const downloadImage = (url: string, filename: string) => {
@@ -505,6 +506,9 @@ export default function App() {
   };
 
   const getFriendlyErrorMessage = (message: string) => {
+    if (message.includes("模型或接口不存在") || message.includes("模型不可用")) {
+      return `当前模型请求失败：${message}。请切换模型后重试。`;
+    }
     if (message.includes("请输入需求")) return "还没有填写创意简报，先补充主题或选择模板。";
     if (message.includes("请选择创意")) return "请先选择至少一个创意方向，再开始生成海报。";
     if (message.includes("请选择海报")) return "还没有选中海报版本，先从结果区挑一张继续操作。";
@@ -594,7 +598,7 @@ export default function App() {
 
   const generateIdeas = async () => {
     const creativeBrief = buildCreativeBrief();
-    if (!creativeBrief.trim() && !styleRefImg) {
+    if (!creativeBrief.trim() && !styleRefImages.length) {
       setError("请输入需求或上传参考图");
       return;
     }
@@ -604,13 +608,15 @@ export default function App() {
     setTaskStatus("queued");
     try {
       const result = await runTask<
-        { prompt: string; selectedStyle: string; selectedRatio: string; styleRefImg: UploadAsset | null },
+        { prompt: string; selectedStyle: string; selectedRatio: string; styleRefImages: UploadAsset[]; selectedTextModel: string; ideaCount: number },
         IdeasTaskResult
       >("ideas", {
         prompt: creativeBrief,
         selectedStyle,
         selectedRatio,
-        styleRefImg,
+        styleRefImages,
+        selectedTextModel,
+        ideaCount,
       }, {
         onStatusChange: (status) => setTaskStatus(status),
       });
@@ -627,7 +633,7 @@ export default function App() {
   };
 
   const optimizeExisting = async () => {
-    if (!uploadedPoster) {
+    if (!uploadedPosters.length) {
       setError("请上传海报");
       return;
     }
@@ -638,19 +644,21 @@ export default function App() {
     try {
       const result = await runTask<
         {
-          uploadedPoster: UploadAsset | null;
+          uploadedPosters: UploadAsset[];
           optimizeFeedback: string;
           selectedStyle: string;
           selectedRatio: string;
           selectedModel: string;
+          imageCount: number;
         },
         PostersTaskResult
       >("optimize-existing", {
-        uploadedPoster,
+        uploadedPosters,
         optimizeFeedback,
         selectedStyle,
         selectedRatio,
         selectedModel,
+        imageCount,
       }, {
         onStatusChange: (status) => setTaskStatus(status),
       });
@@ -687,6 +695,7 @@ export default function App() {
           selectedStyle: string;
           selectedRatio: string;
           selectedModel: string;
+          imageCount: number;
         },
         PostersTaskResult
       >("generate-posters", {
@@ -695,6 +704,7 @@ export default function App() {
         selectedStyle,
         selectedRatio,
         selectedModel,
+        imageCount,
       }, {
         onStatusChange: (status) => setTaskStatus(status),
       });
@@ -746,6 +756,7 @@ export default function App() {
           selectedStyle: string;
           selectedRatio: string;
           selectedModel: string;
+          imageCount: number;
         },
         PostersTaskResult
       >("optimize-poster", {
@@ -755,6 +766,7 @@ export default function App() {
         selectedStyle,
         selectedRatio,
         selectedModel,
+        imageCount,
       }, {
         onStatusChange: (status) => setTaskStatus(status),
       });
@@ -864,6 +876,45 @@ export default function App() {
 
             <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
               <ThemeToggle />
+
+              <div className="relative">
+                <button
+                  onClick={() => setShowTextModelPicker((prev) => !prev)}
+                  className="inline-flex items-center gap-2 rounded-full border border-[var(--border-subtle)] bg-[var(--surface-muted)] px-4 py-2 text-sm font-medium text-[var(--text-primary)] shadow-[var(--shadow-card)] transition hover:bg-[var(--surface-strong)]"
+                >
+                  <FileText size={14} />
+                  {TEXT_MODELS.find((model) => model.id === selectedTextModel)?.label}
+                  <ChevronDown size={14} />
+                </button>
+                {showTextModelPicker ? (
+                  <>
+                    <div className="fixed inset-0 z-40" onClick={() => setShowTextModelPicker(false)} />
+                    <div className="glass-panel absolute right-0 top-full z-50 mt-3 w-72 rounded-[28px] p-3">
+                      <div className="px-3 py-2 text-xs font-medium text-[var(--text-tertiary)]">当前文字模型</div>
+                      {TEXT_MODELS.map((model) => {
+                        const active = model.id === selectedTextModel;
+                        return (
+                          <button
+                            key={model.id}
+                            onClick={() => {
+                              setSelectedTextModel(model.id);
+                              setShowTextModelPicker(false);
+                            }}
+                            className={`flex w-full items-center justify-between rounded-[20px] px-3 py-3 text-left transition ${
+                              active
+                                ? "bg-[var(--accent-soft)] text-[var(--accent-strong)]"
+                                : "text-[var(--text-secondary)] hover:bg-[var(--surface-muted)] hover:text-[var(--text-primary)]"
+                            }`}
+                          >
+                            <span className="text-sm font-medium">{model.label}</span>
+                            <span className="rounded-full bg-[var(--surface-muted)] px-2.5 py-1 text-xs">{model.tag}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : null}
+              </div>
 
               <div className="relative">
                 <button
@@ -1125,6 +1176,50 @@ export default function App() {
 
                     <div>
                       <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
+                        生成数量
+                      </label>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <div>
+                          <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">文案数量</p>
+                          <div className="flex gap-2">
+                            {IDEA_COUNT_OPTIONS.map((count) => (
+                              <button
+                                key={count}
+                                onClick={() => setIdeaCount(count)}
+                                className={`rounded-full px-4 py-2 text-sm font-medium transition ${
+                                  ideaCount === count
+                                    ? "bg-[var(--accent-strong)] text-white"
+                                    : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                                }`}
+                              >
+                                {count}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <div>
+                          <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">图片数量</p>
+                          <div className="flex gap-2">
+                            {IMAGE_COUNT_OPTIONS.map((count) => (
+                              <button
+                                key={count}
+                                onClick={() => setImageCount(count)}
+                                className={`rounded-full px-4 py-2 text-sm font-medium transition ${
+                                  imageCount === count
+                                    ? "bg-[var(--accent-strong)] text-white"
+                                    : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                                }`}
+                              >
+                                {count}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
                         风格参考
                       </label>
                       <button
@@ -1134,26 +1229,30 @@ export default function App() {
                         <input
                           type="file"
                           accept="image/*"
+                          multiple
                           className="hidden"
                           ref={styleRefInputRef}
-                          onChange={(e) => handleFileUpload(e, setStyleRefImg)}
+                          onChange={(e) => handleMultiAssetUpload(e, setStyleRefImages)}
                         />
-                        {styleRefImg ? (
-                          <>
-                            <img src={styleRefImg.url} className="h-16 w-16 rounded-[18px] object-cover" />
-                            <div>
-                              <div className="text-sm font-semibold">{styleRefImg.name}</div>
-                              <div className="mt-1 text-xs text-[var(--text-secondary)]">点击更换参考图</div>
-                            </div>
-                          </>
+                        {styleRefImages.length ? (
+                          <div className="flex flex-wrap gap-3">
+                            {styleRefImages.map((img, index) => (
+                              <div key={img.id || `${img.name}-${index}`} className="relative">
+                                <img src={img.url} className="h-16 w-16 rounded-[18px] object-cover" />
+                                <span className="absolute -left-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-strong)] text-[10px] font-semibold text-white">
+                                  {index + 1}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
                         ) : (
                           <>
                             <div className="flex h-14 w-14 items-center justify-center rounded-[18px] bg-[var(--surface-strong)] text-[var(--text-secondary)]">
                               <Upload size={18} />
                             </div>
                             <div>
-                              <div className="text-sm font-semibold">上传风格参考图</div>
-                              <div className="mt-1 text-xs text-[var(--text-secondary)]">可选，用于智能模式或补充美术方向</div>
+                              <div className="text-sm font-semibold">上传风格参考图（可多张）</div>
+                              <div className="mt-1 text-xs text-[var(--text-secondary)]">支持在描述里用 @图1、@图2 指向不同参考图</div>
                             </div>
                           </>
                         )}
@@ -1231,9 +1330,22 @@ export default function App() {
                       <textarea
                         value={prompt}
                         onChange={(e) => setPrompt(e.target.value)}
-                        placeholder="补充你还想强调的信息，例如文案重点、产品卖点、禁忌项..."
+                        placeholder="补充你还想强调的信息，例如把@图1的产品放进@图2的场景里..."
                         className="soft-input h-36 w-full rounded-[24px] px-5 py-4 text-sm resize-none"
                       />
+                      {styleRefImages.length ? (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {styleRefImages.map((_, index) => (
+                            <button
+                              key={index}
+                              onClick={() => setPrompt((prev) => `${prev}@图${index + 1} `)}
+                              className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]"
+                            >
+                              @图{index + 1}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
                       <p className="mt-3 text-xs text-[var(--text-tertiary)]">如果赶时间，只填上面的简报字段也能直接开始。</p>
                     </div>
 
@@ -1241,7 +1353,7 @@ export default function App() {
                       onClick={generateIdeas}
                       className="w-full rounded-full bg-[var(--accent-strong)] px-5 py-3.5 text-sm font-semibold text-white shadow-[var(--shadow-card)] transition hover:opacity-90"
                     >
-                      生成 6 个创意方向
+                      生成 {ideaCount} 个创意方向
                     </button>
                   </div>
                 </WorkbenchCard>
@@ -1259,21 +1371,27 @@ export default function App() {
                       <input
                         type="file"
                         accept="image/*"
+                        multiple
                         className="hidden"
                         ref={uploadPosterRef}
-                        onChange={(e) => handleFileUpload(e, setUploadedPoster)}
+                        onChange={(e) => handleMultiAssetUpload(e, setUploadedPosters)}
                       />
-                      {uploadedPoster ? (
-                        <>
-                          <img src={uploadedPoster.url} className="max-h-64 rounded-[22px] object-contain shadow-[var(--shadow-card)]" />
-                          <div className="mt-4 text-sm font-semibold">{uploadedPoster.name}</div>
-                          <div className="mt-1 text-xs text-[var(--text-secondary)]">点击更换海报原图</div>
-                        </>
+                      {uploadedPosters.length ? (
+                        <div className="flex flex-wrap justify-center gap-3">
+                          {uploadedPosters.map((img, index) => (
+                            <div key={img.id || `${img.name}-${index}`} className="relative">
+                              <img src={img.url} className="h-24 w-24 rounded-[18px] object-cover shadow-[var(--shadow-card)]" />
+                              <span className="absolute -left-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-strong)] text-[10px] font-semibold text-white">
+                                {index + 1}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
                       ) : (
                         <>
                           <Upload size={24} className="text-[var(--text-secondary)]" />
-                          <div className="mt-4 text-sm font-semibold">上传海报原图</div>
-                          <div className="mt-1 text-xs text-[var(--text-secondary)]">支持继续优化与风格重做</div>
+                          <div className="mt-4 text-sm font-semibold">上传海报原图（可多张）</div>
+                          <div className="mt-1 text-xs text-[var(--text-secondary)]">支持在描述里用 @图1、@图2 做组合重构</div>
                         </>
                       )}
                     </button>
@@ -1281,20 +1399,33 @@ export default function App() {
                     <textarea
                       value={optimizeFeedback}
                       onChange={(e) => setOptimizeFeedback(e.target.value)}
-                      placeholder="例如：统一色彩、提升高级感、强化产品主体..."
+                      placeholder="例如：把@图1的产品，放在@图2的花园里，并整体更高级..."
                       className="soft-input h-32 w-full rounded-[24px] px-5 py-4 text-sm resize-none"
                     />
+                    {uploadedPosters.length ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {uploadedPosters.map((_, index) => (
+                          <button
+                            key={index}
+                            onClick={() => setOptimizeFeedback((prev) => `${prev}@图${index + 1} `)}
+                            className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]"
+                          >
+                            @图{index + 1}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
 
                     <button
                       onClick={optimizeExisting}
-                      disabled={!uploadedPoster}
+                      disabled={!uploadedPosters.length}
                       className={`w-full rounded-full px-5 py-3.5 text-sm font-semibold transition ${
-                        uploadedPoster
+                        uploadedPosters.length
                           ? "bg-[var(--success-strong)] text-white shadow-[var(--shadow-card)] hover:opacity-90"
                           : "bg-[var(--surface-muted)] text-[var(--text-tertiary)]"
                       }`}
                     >
-                      直接优化出图 × 3
+                      直接优化出图 × {imageCount}
                     </button>
                   </div>
                 </WorkbenchCard>
@@ -1335,7 +1466,7 @@ export default function App() {
                     </div>
 
                     <div className="flex flex-col gap-3 rounded-[24px] bg-[var(--surface-muted)] p-4 sm:flex-row sm:items-center sm:justify-between">
-                      <p className="text-sm text-[var(--text-secondary)]">已选 {selectedIdeas.length} 个创意，将生成 {selectedIdeas.length * 3} 张海报。</p>
+                      <p className="text-sm text-[var(--text-secondary)]">已选 {selectedIdeas.length} 个创意，将生成 {selectedIdeas.length * imageCount} 张海报。</p>
                       <button
                         onClick={generatePosters}
                         disabled={!selectedIdeas.length}
@@ -1690,7 +1821,7 @@ export default function App() {
                           : "bg-[var(--surface-muted)] text-[var(--text-tertiary)]"
                       }`}
                     >
-                      优化生成 × 3
+                      优化生成 × {imageCount}
                     </button>
                   </div>
                 </WorkbenchCard>
