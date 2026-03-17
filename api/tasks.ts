@@ -1,4 +1,4 @@
-import { runTaskByType } from "../lib/task-service";
+import { runTaskByType } from "./_lib/task-service";
 
 export const config = {
   runtime: "nodejs",
