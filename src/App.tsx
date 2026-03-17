@@ -76,6 +76,8 @@ const QUICK_FEEDBACK_CHIPS = [
 ];
 const IDEA_COUNT_OPTIONS = [2, 4, 6] as const;
 const IMAGE_COUNT_OPTIONS = [1, 2, 3] as const;
+const STORAGE_KEY = "poster_storage";
+const MAX_PERSISTED_STORAGE_ITEMS = 24;
 
 type UploadAsset = {
   id?: string;
@@ -101,6 +103,16 @@ type StorageItem = {
   label: string;
   timestamp: number;
 };
+
+function isPersistableStorageUrl(url: string) {
+  return /^https?:\/\//i.test(url);
+}
+
+function buildPersistedStorage(items: StorageItem[]) {
+  return items
+    .filter((item) => isPersistableStorageUrl(item.url))
+    .slice(0, MAX_PERSISTED_STORAGE_ITEMS);
+}
 
 type IdeasTaskResult = {
   ideas: string[];
@@ -362,7 +374,7 @@ export default function App() {
 
   const [storage, setStorage] = useState<StorageItem[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem("poster_storage") || "[]");
+      return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
     } catch {
       return [];
     }
@@ -372,7 +384,19 @@ export default function App() {
   const [notice, setNotice] = useState<NoticeState>(null);
 
   useEffect(() => {
-    localStorage.setItem("poster_storage", JSON.stringify(storage));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(buildPersistedStorage(storage)));
+    } catch {
+      try {
+        localStorage.removeItem(STORAGE_KEY);
+      } catch {
+        // ignore storage cleanup failures
+      }
+      setNotice({
+        tone: "error",
+        message: "本地存储空间已满，超大图片将只保留在当前会话中。",
+      });
+    }
   }, [storage]);
 
   useEffect(() => {
@@ -383,7 +407,13 @@ export default function App() {
 
   const addToStorage = useCallback((url: string, label = "海报") => {
     const item = { id: Date.now().toString() + Math.random().toString(36).slice(2), url, label, timestamp: Date.now() };
-    setStorage((prev) => [item, ...prev]);
+    setStorage((prev) => [item, ...prev].slice(0, 40));
+    if (!isPersistableStorageUrl(url)) {
+      setNotice({
+        tone: "success",
+        message: "结果已加入暂存区，超大图片不会写入本地持久存储。",
+      });
+    }
     return item;
   }, []);
 
@@ -639,7 +669,7 @@ export default function App() {
     }
     setLoading(true);
     setError("");
-    setLoadingText("正在优化海报并生成 3 个版本...");
+    setLoadingText(`正在优化海报并生成 ${imageCount} 个版本...`);
     setTaskStatus("queued");
     try {
       const result = await runTask<
@@ -685,7 +715,7 @@ export default function App() {
     }
     setLoading(true);
     setError("");
-    setLoadingText(`正在生成 ${selectedIdeas.length * 3} 张海报...`);
+    setLoadingText(`正在生成 ${selectedIdeas.length * imageCount} 张海报...`);
     setTaskStatus("queued");
     try {
       const result = await runTask<
@@ -710,8 +740,8 @@ export default function App() {
       });
       const generated = decorateGeneratedPosters(result.posters, {
         labels: result.posters.map((_, index) => {
-          const ideaIndex = Math.floor(index / 3);
-          const variationIndex = (index % 3) + 1;
+          const ideaIndex = Math.floor(index / imageCount);
+          const variationIndex = (index % imageCount) + 1;
           return `创意${selectedIdeas[ideaIndex] + 1}-v${variationIndex}`;
         }),
         sourceLabel: "创意生成",
