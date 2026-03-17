@@ -1,10 +1,23 @@
 import { randomUUID } from "node:crypto";
 
-const BASE_URL = process.env.POSTER_API_BASE_URL || "https://ai.scd666.com";
-const API_KEY = process.env.POSTER_API_KEY || "";
+const RAW_BASE_URL = process.env.POSTER_API_BASE_URL || process.env.OPENAI_BASE_URL || "https://ai.scd666.com";
+const API_KEY = process.env.POSTER_API_KEY || process.env.OPENAI_API_KEY || "";
 const TEXT_MODEL = process.env.POSTER_TEXT_MODEL || "deepseek-v3.2-exp";
 const DEFAULT_IDEA_COUNT = Number(process.env.POSTER_IDEA_COUNT || 6);
 const DEFAULT_IMAGE_COUNT = Number(process.env.POSTER_IMAGE_COUNT || 3);
+
+function stripTrailingSlash(url: string) {
+  return url.replace(/\/+$/, "");
+}
+
+function stripTrailingV1(url: string) {
+  return stripTrailingSlash(url).replace(/\/v1$/i, "");
+}
+
+const ROOT_BASE_URL = stripTrailingV1(RAW_BASE_URL);
+const OPENAI_BASE_URL = stripTrailingSlash(RAW_BASE_URL).endsWith("/v1")
+  ? stripTrailingSlash(RAW_BASE_URL)
+  : `${ROOT_BASE_URL}/v1`;
 
 const MODEL_ENDPOINT_MAP: Record<string, { type: string; endpoint: string }> = {
   "gemini-3.1-flash-image-preview": { type: "openai_chat", endpoint: "/v1/chat/completions" },
@@ -111,8 +124,21 @@ export function getServiceConfig() {
   return {
     ok: true,
     configured: Boolean(API_KEY),
-    baseUrl: BASE_URL,
+    envKeys: {
+      hasPosterApiKey: Boolean(process.env.POSTER_API_KEY),
+      hasPosterBaseUrl: Boolean(process.env.POSTER_API_BASE_URL),
+      hasOpenAiApiKey: Boolean(process.env.OPENAI_API_KEY),
+      hasOpenAiBaseUrl: Boolean(process.env.OPENAI_BASE_URL),
+    },
+    baseUrl: RAW_BASE_URL,
+    normalizedBaseUrl: ROOT_BASE_URL,
+    openaiBaseUrl: OPENAI_BASE_URL,
     textModel: TEXT_MODEL,
+    tips: [
+      "如果 configured 为 false，优先检查 Vercel 环境变量是否已重新部署生效。",
+      "如果 OPENAI_BASE_URL 已包含 /v1，系统会自动避免重复拼接。",
+      "MJ 请求会自动使用去掉 /v1 后的根地址。",
+    ],
   };
 }
 
@@ -130,7 +156,8 @@ function authHeaders() {
 
 async function callOpenAIChat(messages: any[], model: string, extra: any = {}) {
   const ep = MODEL_ENDPOINT_MAP[model]?.endpoint || "/v1/chat/completions";
-  const res = await fetch(`${BASE_URL}${ep}`, {
+  const normalizedEndpoint = ep.replace(/^\/v1/, "");
+  const res = await fetch(`${OPENAI_BASE_URL}${normalizedEndpoint}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({ model, messages, ...extra }),
@@ -153,7 +180,7 @@ async function callTextModel(messages: any[], model = TEXT_MODEL, extra: any = {
 
 async function callFlux(prompt: string, model: string, ratio: string): Promise<string> {
   const size = RATIO_TO_SIZE[ratio] || RATIO_TO_SIZE["1:1"];
-  const res = await fetch(`${BASE_URL}/v1/images/generations`, {
+  const res = await fetch(`${OPENAI_BASE_URL}/images/generations`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({ model, prompt, n: 1, size: `${size.width}x${size.height}` }),
@@ -193,7 +220,7 @@ async function callMJ(model: string, prompt: string, ratio: string, base64Images
     body = { base64: base64Images[0] };
   }
 
-  const submitRes = await fetch(`${BASE_URL}${ep}`, {
+  const submitRes = await fetch(`${ROOT_BASE_URL}${ep}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify(body),
@@ -219,7 +246,7 @@ async function callMJ(model: string, prompt: string, ratio: string, base64Images
 
   for (let i = 0; i < 120; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 2000));
-    const pollingRes = await fetch(`${BASE_URL}/mj/task/${taskId}/fetch`, {
+    const pollingRes = await fetch(`${ROOT_BASE_URL}/mj/task/${taskId}/fetch`, {
       method: "GET",
       headers: authHeaders(),
     });
