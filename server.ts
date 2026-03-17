@@ -1,0 +1,488 @@
+import "dotenv/config";
+import express from "express";
+import { randomUUID } from "node:crypto";
+
+const app = express();
+const port = Number(process.env.PORT || 3001);
+
+const BASE_URL = process.env.POSTER_API_BASE_URL || "https://ai.scd666.com";
+const API_KEY = process.env.POSTER_API_KEY || "";
+const TEXT_MODEL = process.env.POSTER_TEXT_MODEL || "deepseek-v3.2-exp";
+
+const MODEL_ENDPOINT_MAP: Record<string, { type: string; endpoint: string }> = {
+  "gemini-3.1-flash-image-preview": { type: "openai_chat", endpoint: "/v1/chat/completions" },
+  "gemini-3-pro-image-preview": { type: "openai_chat", endpoint: "/v1/chat/completions" },
+  mj_imagine: { type: "mj", endpoint: "/mj/submit/imagine" },
+  mj_blend: { type: "mj", endpoint: "/mj/submit/blend" },
+  mj_describe: { type: "mj", endpoint: "/mj/submit/describe" },
+  "flux-pro": { type: "flux", endpoint: "/v1/images/generations" },
+  "flux-1.1-pro": { type: "flux", endpoint: "/v1/images/generations" },
+};
+
+const STYLE_PROMPTS: Record<string, string> = {
+  photography:
+    "Cinematic photography poster, professional studio lighting, high-resolution, photorealistic, dramatic composition, commercial quality",
+  handdrawn:
+    "Hand-drawn illustration poster, watercolor and ink textures, artistic brushstrokes, warm organic feel, hand-crafted aesthetic",
+  "3d":
+    "3D rendered poster, Cinema 4D style, volumetric lighting, glossy materials, depth of field, modern 3D design",
+  abstract:
+    "Abstract art poster, bold geometric forms, avant-garde composition, vibrant color blocks, contemporary art style",
+  flat:
+    "Flat design poster, clean vector graphics, minimal shadows, bold solid colors, modern flat illustration style",
+  miniature:
+    "Miniature tilt-shift diorama poster, tiny detailed world, selective focus, toy-like proportions, warm lighting",
+  product:
+    "Product showcase poster, commercial photography, clean background, professional product placement, premium commercial quality",
+  anime: "Anime style poster, Japanese animation aesthetic, vivid colors, dynamic composition, manga-inspired illustration",
+  smart: "",
+};
+
+const RATIO_TO_SIZE: Record<string, { width: number; height: number }> = {
+  "9:16": { width: 720, height: 1280 },
+  "3:4": { width: 768, height: 1024 },
+  "1:1": { width: 1024, height: 1024 },
+  "4:3": { width: 1024, height: 768 },
+  "16:9": { width: 1280, height: 720 },
+};
+
+const RATIO_TO_MJ_AR: Record<string, string> = {
+  "9:16": "--ar 9:16",
+  "3:4": "--ar 3:4",
+  "1:1": "--ar 1:1",
+  "4:3": "--ar 4:3",
+  "16:9": "--ar 16:9",
+};
+
+type UploadAsset = {
+  id?: string;
+  mimeType: string;
+  data: string;
+  url: string;
+  name: string;
+};
+
+type PosterResult = {
+  id: string;
+  url: string;
+  ideaText: string;
+  timestamp: number;
+};
+
+type TaskStatus = "queued" | "running" | "completed" | "failed";
+
+type TaskRecord = {
+  id: string;
+  type: string;
+  status: TaskStatus;
+  createdAt: number;
+  updatedAt: number;
+  result?: unknown;
+  error?: string;
+};
+
+type CreateIdeasPayload = {
+  prompt: string;
+  selectedStyle: string;
+  selectedRatio: string;
+  styleRefImg: UploadAsset | null;
+};
+
+type GeneratePostersPayload = {
+  selectedIdeas: number[];
+  ideas: string[];
+  selectedStyle: string;
+  selectedRatio: string;
+  selectedModel: string;
+};
+
+type OptimizeExistingPayload = {
+  uploadedPoster: UploadAsset | null;
+  optimizeFeedback: string;
+  selectedStyle: string;
+  selectedRatio: string;
+  selectedModel: string;
+};
+
+type OptimizePosterPayload = {
+  activePoster: PosterResult | null;
+  feedbackText: string;
+  refImages: UploadAsset[];
+  selectedStyle: string;
+  selectedRatio: string;
+  selectedModel: string;
+};
+
+type GenerateProposalPayload = {
+  finalPoster: PosterResult | null;
+};
+
+const tasks = new Map<string, TaskRecord>();
+
+app.use(express.json({ limit: "25mb" }));
+
+function assertConfigured() {
+  if (!API_KEY) {
+    throw new Error("服务端未配置 POSTER_API_KEY");
+  }
+}
+
+function authHeaders() {
+  assertConfigured();
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${API_KEY}`,
+  };
+}
+
+async function callOpenAIChat(messages: any[], model: string, extra: any = {}) {
+  const ep = MODEL_ENDPOINT_MAP[model]?.endpoint || "/v1/chat/completions";
+  const res = await fetch(`${BASE_URL}${ep}`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ model, messages, ...extra }),
+  });
+  if (!res.ok) {
+    let message = `请求失败 (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data.error?.message) message = data.error.message;
+    } catch {}
+    throw new Error(message);
+  }
+  return res.json();
+}
+
+async function callTextModel(messages: any[], extra: any = {}) {
+  return callOpenAIChat(messages, TEXT_MODEL, extra);
+}
+
+async function callFlux(prompt: string, model: string, ratio: string): Promise<string> {
+  const size = RATIO_TO_SIZE[ratio] || RATIO_TO_SIZE["1:1"];
+  const res = await fetch(`${BASE_URL}/v1/images/generations`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify({ model, prompt, n: 1, size: `${size.width}x${size.height}` }),
+  });
+  if (!res.ok) {
+    let message = `Flux 失败 (${res.status})`;
+    try {
+      const data = await res.json();
+      if (data.error?.message) message = data.error.message;
+    } catch {}
+    throw new Error(message);
+  }
+  const data = await res.json();
+  const image = data.data?.[0];
+  if (image?.url) return image.url;
+  if (image?.b64_json) return `data:image/png;base64,${image.b64_json}`;
+  throw new Error("Flux 未返回图片");
+}
+
+async function callMJ(model: string, prompt: string, ratio: string, base64Images?: string[]): Promise<string> {
+  const ep = MODEL_ENDPOINT_MAP[model]?.endpoint;
+  if (!ep) throw new Error(`未知 MJ 端点: ${model}`);
+
+  let body: any = {};
+  if (model === "mj_imagine") {
+    body = { prompt: `${prompt} ${RATIO_TO_MJ_AR[ratio] || "--ar 1:1"}` };
+    if (base64Images?.length) body.base64Array = base64Images;
+  } else if (model === "mj_blend") {
+    if (!base64Images || base64Images.length < 2) throw new Error("MJ Blend 需要至少 2 张图片");
+    body = {
+      base64Array: base64Images,
+      dimensions: ratio === "16:9" ? "LANDSCAPE" : ratio === "9:16" ? "PORTRAIT" : "SQUARE",
+    };
+  } else if (model === "mj_describe") {
+    if (!base64Images?.length) throw new Error("MJ Describe 需要一张图片");
+    body = { base64: base64Images[0] };
+  }
+
+  const submitRes = await fetch(`${BASE_URL}${ep}`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  if (!submitRes.ok) {
+    let message = `MJ 提交失败 (${submitRes.status})`;
+    try {
+      const data = await submitRes.json();
+      message = data.description || data.error?.message || message;
+    } catch {}
+    throw new Error(message);
+  }
+  const submitData = await submitRes.json();
+  const taskId = submitData.result || submitData.id || submitData.taskId;
+
+  if (!taskId) {
+    if (submitData.imageUrl) return submitData.imageUrl;
+    if (submitData.url) return submitData.url;
+    if (model === "mj_describe" && submitData.prompt) return submitData.prompt;
+    throw new Error(`MJ 未返回任务ID: ${JSON.stringify(submitData).substring(0, 200)}`);
+  }
+
+  for (let i = 0; i < 120; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    try {
+      const pollingRes = await fetch(`${BASE_URL}/mj/task/${taskId}/fetch`, {
+        method: "GET",
+        headers: authHeaders(),
+      });
+      if (!pollingRes.ok) continue;
+      const pollingData = await pollingRes.json();
+      const status = (pollingData.status || "").toUpperCase();
+      if (status === "SUCCESS" || status === "COMPLETED") {
+        const url = pollingData.imageUrl || pollingData.result?.imageUrl || pollingData.url;
+        if (url) return url;
+        if (model === "mj_describe") return pollingData.prompt || pollingData.result?.prompt || "描述结果为空";
+        throw new Error("MJ 任务完成但无图片");
+      }
+      if (status === "FAILED" || status === "ERROR") {
+        throw new Error(`MJ 失败: ${pollingData.failReason || "未知"}`);
+      }
+    } catch (error: any) {
+      if (error.message.includes("MJ 失败")) throw error;
+    }
+  }
+
+  throw new Error("MJ 任务超时");
+}
+
+function extractImageData(content: string | undefined | null): string {
+  if (!content) throw new Error("API 返回空内容");
+  const markdown = content.match(/!\[.*?\]\((.*?)\)/);
+  if (markdown?.[1]) return markdown[1];
+  const http = content.match(/(https?:\/\/[^\s)"']+)/);
+  if (http?.[1]) return http[1];
+  if (content.includes("data:image")) {
+    const base64 = content.match(/data:image\/[^;]+;base64,[a-zA-Z0-9+/=]+/);
+    if (base64) return base64[0];
+  }
+  const trimmed = content.trim();
+  if (trimmed.length > 500 && !trimmed.includes(" ")) return `data:image/png;base64,${trimmed}`;
+  throw new Error(`未返回有效图片: "${content.substring(0, 80)}..."`);
+}
+
+async function generateImage(prompt: string, model: string, ratio: string, imageUrls?: string[]): Promise<string> {
+  const config = MODEL_ENDPOINT_MAP[model];
+  if (!config) throw new Error(`不支持的模型: ${model}`);
+  if (config.type === "openai_chat") {
+    const content: any[] = [{ type: "text", text: prompt }];
+    imageUrls?.forEach((url) => content.push({ type: "image_url", image_url: { url } }));
+    const res = await callOpenAIChat([{ role: "user", content }], model);
+    return extractImageData(res.choices?.[0]?.message?.content);
+  }
+  if (config.type === "flux") return callFlux(prompt, model, ratio);
+  if (config.type === "mj") return callMJ(model, prompt, ratio, imageUrls);
+  throw new Error(`未知类型: ${config.type}`);
+}
+
+function updateTask(taskId: string, patch: Partial<TaskRecord>) {
+  const current = tasks.get(taskId);
+  if (!current) return;
+  tasks.set(taskId, {
+    ...current,
+    ...patch,
+    updatedAt: Date.now(),
+  });
+}
+
+async function runCreateIdeasTask(payload: CreateIdeasPayload) {
+  if (!payload.prompt.trim() && !payload.styleRefImg) {
+    throw new Error("请输入需求或上传参考图");
+  }
+  const content: any[] = [
+    {
+      type: "text",
+      text: `你是一位顶尖海报设计创意总监。生成6个完全不同的创意提示词（英文prompt），详细描述海报视觉内容、构图、氛围。
+需求: "${payload.prompt}"
+美术风格: ${payload.selectedStyle}
+画幅: ${payload.selectedRatio}
+${payload.selectedStyle === "smart" && payload.styleRefImg ? "根据参考图风格决定方向。" : ""}
+严格返回JSON: {"ideas": ["p1","p2","p3","p4","p5","p6"]}`,
+    },
+  ];
+  if (payload.styleRefImg) {
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:${payload.styleRefImg.mimeType};base64,${payload.styleRefImg.data}` },
+    });
+  }
+  const res = await callTextModel([{ role: "user", content }], { response_format: { type: "json_object" } });
+  const parsed = JSON.parse(res.choices?.[0]?.message?.content || "{}");
+  const ideas = parsed.ideas || (Object.values(parsed).find(Array.isArray) as string[]) || [];
+  while (ideas.length < 6) {
+    ideas.push("Creative poster design with unique artistic composition and bold visual impact");
+  }
+  return { ideas: ideas.slice(0, 6) };
+}
+
+async function runGeneratePostersTask(payload: GeneratePostersPayload) {
+  if (!payload.selectedIdeas.length) throw new Error("请选择创意");
+  const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const posters: PosterResult[] = [];
+  for (const idx of payload.selectedIdeas) {
+    const idea = payload.ideas[idx];
+    const variants = await Promise.all(
+      [1, 2, 3].map((version) =>
+        generateImage(
+          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. High quality poster. Variation ${version}.`,
+          payload.selectedModel,
+          payload.selectedRatio,
+        ),
+      ),
+    );
+    variants.forEach((url, index) => {
+      posters.push({
+        id: randomUUID(),
+        url,
+        ideaText: idea.substring(0, 60),
+        timestamp: Date.now(),
+      });
+    });
+  }
+  return { posters };
+}
+
+async function runOptimizeExistingTask(payload: OptimizeExistingPayload) {
+  if (!payload.uploadedPoster) throw new Error("请上传海报");
+  const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const imageUrl = `data:${payload.uploadedPoster.mimeType};base64,${payload.uploadedPoster.data}`;
+  const results = await Promise.all(
+    [1, 2, 3].map((version) =>
+      generateImage(
+        `Redesign and optimize this poster. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${
+          payload.optimizeFeedback || "Make it more professional and visually striking."
+        } Variation ${version}.`,
+        payload.selectedModel,
+        payload.selectedRatio,
+        [imageUrl],
+      ),
+    ),
+  );
+  return {
+    posters: results.map((url, index) => ({
+      id: randomUUID(),
+      url,
+      ideaText: `原图优化 v${index + 1}`,
+      timestamp: Date.now(),
+    })),
+  };
+}
+
+async function runOptimizePosterTask(payload: OptimizePosterPayload) {
+  if (!payload.activePoster) throw new Error("请选择海报");
+  if (!payload.feedbackText.trim()) throw new Error("请输入反馈");
+  const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const referenced: UploadAsset[] = [];
+  const regex = /@图\s*(\d+)/g;
+  let matched;
+  while ((matched = regex.exec(payload.feedbackText)) !== null) {
+    const index = parseInt(matched[1], 10) - 1;
+    if (payload.refImages[index]) referenced.push(payload.refImages[index]);
+  }
+  const imageUrls = [payload.activePoster.url, ...referenced.map((img) => `data:${img.mimeType};base64,${img.data}`)];
+  const basePrompt = `Optimize this poster: "${payload.feedbackText}". ${stylePrompt} Ratio: ${payload.selectedRatio}. Apply changes.`;
+  const results = await Promise.all(
+    [1, 2, 3].map((version) => generateImage(`${basePrompt} Variation ${version}.`, payload.selectedModel, payload.selectedRatio, imageUrls)),
+  );
+  return {
+    posters: results.map((url, index) => ({
+      id: randomUUID(),
+      url,
+      ideaText: `优化: ${payload.feedbackText.substring(0, 40)}`,
+      timestamp: Date.now(),
+    })),
+  };
+}
+
+async function runGenerateProposalTask(payload: GenerateProposalPayload) {
+  if (!payload.finalPoster) throw new Error("请选择定稿");
+  const res = await callTextModel([
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `你是资深品牌策划师。为这张海报撰写专业提案：
+1. 设计理念
+2. 视觉分析（构图、色彩、字体）
+3. 受众与传播策略
+4. 应用场景
+5. 优化方向
+中文撰写，有深度。`,
+        },
+        { type: "image_url", image_url: { url: payload.finalPoster.url } },
+      ],
+    },
+  ]);
+  return { proposalText: res.choices?.[0]?.message?.content || "生成失败" };
+}
+
+async function runTaskByType(type: string, payload: any) {
+  switch (type) {
+    case "ideas":
+      return runCreateIdeasTask(payload as CreateIdeasPayload);
+    case "generate-posters":
+      return runGeneratePostersTask(payload as GeneratePostersPayload);
+    case "optimize-existing":
+      return runOptimizeExistingTask(payload as OptimizeExistingPayload);
+    case "optimize-poster":
+      return runOptimizePosterTask(payload as OptimizePosterPayload);
+    case "proposal":
+      return runGenerateProposalTask(payload as GenerateProposalPayload);
+    default:
+      throw new Error(`未知任务类型: ${type}`);
+  }
+}
+
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    configured: Boolean(API_KEY),
+    baseUrl: BASE_URL,
+    textModel: TEXT_MODEL,
+  });
+});
+
+app.post("/api/tasks", async (req, res) => {
+  const { type, payload } = req.body || {};
+  if (!type) {
+    res.status(400).json({ error: "缺少任务类型" });
+    return;
+  }
+
+  const taskId = randomUUID();
+  tasks.set(taskId, {
+    id: taskId,
+    type,
+    status: "queued",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  queueMicrotask(async () => {
+    updateTask(taskId, { status: "running" });
+    try {
+      const result = await runTaskByType(type, payload);
+      updateTask(taskId, { status: "completed", result });
+    } catch (error: any) {
+      updateTask(taskId, { status: "failed", error: error.message || "任务执行失败" });
+    }
+  });
+
+  res.status(202).json({ taskId });
+});
+
+app.get("/api/tasks/:taskId", (req, res) => {
+  const task = tasks.get(req.params.taskId);
+  if (!task) {
+    res.status(404).json({ error: "任务不存在" });
+    return;
+  }
+  res.json(task);
+});
+
+app.listen(port, () => {
+  console.log(`poster-project api listening on http://localhost:${port}`);
+});

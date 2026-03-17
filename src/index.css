@@ -1,1 +1,103 @@
 @import "tailwindcss";
+
+:root {
+  --bg-canvas: #f4f5f7;
+  --bg-accent: radial-gradient(circle at top left, rgba(76, 132, 255, 0.14), transparent 28%), radial-gradient(circle at bottom right, rgba(255, 170, 112, 0.18), transparent 32%), linear-gradient(180deg, #fafbfc 0%, #eef1f5 100%);
+  --surface: rgba(255, 255, 255, 0.84);
+  --surface-elevated: rgba(255, 255, 255, 0.7);
+  --surface-muted: rgba(255, 255, 255, 0.55);
+  --surface-strong: #ffffff;
+  --text-primary: #101828;
+  --text-secondary: #475467;
+  --text-tertiary: #667085;
+  --border-subtle: rgba(15, 23, 42, 0.08);
+  --border-strong: rgba(15, 23, 42, 0.16);
+  --accent-strong: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.12);
+  --success-strong: #059669;
+  --success-soft: rgba(5, 150, 105, 0.12);
+  --danger-strong: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.12);
+  --shadow-soft: 0 18px 48px rgba(15, 23, 42, 0.08);
+  --shadow-card: 0 8px 24px rgba(15, 23, 42, 0.08);
+}
+
+[data-theme="dark"] {
+  --bg-canvas: #0b1020;
+  --bg-accent: radial-gradient(circle at top left, rgba(87, 140, 255, 0.18), transparent 28%), radial-gradient(circle at bottom right, rgba(64, 200, 255, 0.14), transparent 26%), linear-gradient(180deg, #0a1020 0%, #111827 100%);
+  --surface: rgba(14, 23, 42, 0.8);
+  --surface-elevated: rgba(10, 18, 32, 0.72);
+  --surface-muted: rgba(15, 23, 42, 0.56);
+  --surface-strong: #101828;
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-tertiary: #94a3b8;
+  --border-subtle: rgba(148, 163, 184, 0.12);
+  --border-strong: rgba(148, 163, 184, 0.22);
+  --accent-strong: #7aa2ff;
+  --accent-soft: rgba(122, 162, 255, 0.18);
+  --success-strong: #34d399;
+  --success-soft: rgba(52, 211, 153, 0.16);
+  --danger-strong: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.16);
+  --shadow-soft: 0 18px 48px rgba(0, 0, 0, 0.34);
+  --shadow-card: 0 10px 28px rgba(0, 0, 0, 0.3);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-accent);
+  color: var(--text-primary);
+  font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+@layer components {
+  .glass-panel {
+    background: var(--surface);
+    border: 1px solid var(--border-subtle);
+    box-shadow: var(--shadow-soft);
+    backdrop-filter: blur(28px);
+  }
+
+  .surface-card {
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-subtle);
+    box-shadow: var(--shadow-card);
+    backdrop-filter: blur(22px);
+  }
+
+  .soft-input {
+    background: var(--surface-muted);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+  }
+
+  .soft-input::placeholder {
+    color: var(--text-tertiary);
+  }
+
+  .soft-input:focus {
+    outline: none;
+    border-color: var(--border-strong);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-strong) 18%, transparent);
+  }
+}
