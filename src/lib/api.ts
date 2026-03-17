@@ -34,7 +34,7 @@ async function request<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
 }
 
 export async function createTask<TPayload>(type: TaskType, payload: TPayload) {
-  return request<{ taskId: string }>("/api/tasks", {
+  return request<{ taskId: string; status?: TaskStatus; result?: unknown }>("/api/tasks", {
     method: "POST",
     body: JSON.stringify({ type, payload }),
   });
@@ -52,7 +52,13 @@ export async function runTask<TPayload, TResult>(
     onStatusChange?: (status: TaskStatus) => void;
   },
 ) {
-  const { taskId } = await createTask(type, payload);
+  const created = await createTask(type, payload);
+  if (created.status === "completed") {
+    options?.onStatusChange?.("completed");
+    return created.result as TResult;
+  }
+
+  const { taskId } = created;
   const intervalMs = options?.intervalMs ?? 1500;
 
   while (true) {
