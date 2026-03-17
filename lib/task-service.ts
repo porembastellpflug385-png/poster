@@ -1,10 +1,15 @@
-import { randomUUID } from "node:crypto";
-
 const RAW_BASE_URL = process.env.POSTER_API_BASE_URL || process.env.OPENAI_BASE_URL || "https://ai.scd666.com";
 const API_KEY = process.env.POSTER_API_KEY || process.env.OPENAI_API_KEY || "";
 const TEXT_MODEL = process.env.POSTER_TEXT_MODEL || "deepseek-v3.2-exp";
 const DEFAULT_IDEA_COUNT = Number(process.env.POSTER_IDEA_COUNT || 6);
 const DEFAULT_IMAGE_COUNT = Number(process.env.POSTER_IMAGE_COUNT || 3);
+
+function createId() {
+  if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function stripTrailingSlash(url: string) {
   return url.replace(/\/+$/, "");
@@ -339,7 +344,7 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
         ),
       ),
     );
-    variants.forEach((url) => posters.push({ id: randomUUID(), url, ideaText: idea.substring(0, 60), timestamp: Date.now() }));
+    variants.forEach((url) => posters.push({ id: createId(), url, ideaText: idea.substring(0, 60), timestamp: Date.now() }));
   }
   return { posters };
 }
@@ -362,7 +367,7 @@ async function runOptimizeExistingTask(payload: OptimizeExistingPayload) {
     ),
   );
   return {
-    posters: results.map((url, index) => ({ id: randomUUID(), url, ideaText: `原图优化 v${index + 1}`, timestamp: Date.now() })),
+    posters: results.map((url, index) => ({ id: createId(), url, ideaText: `原图优化 v${index + 1}`, timestamp: Date.now() })),
   };
 }
 
@@ -387,7 +392,7 @@ async function runOptimizePosterTask(payload: OptimizePosterPayload) {
   );
   return {
     posters: results.map((url, index) => ({
-      id: randomUUID(),
+      id: createId(),
       url,
       ideaText: `优化: ${payload.feedbackText.substring(0, 40)}`,
       timestamp: Date.now(),

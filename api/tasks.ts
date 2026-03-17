@@ -1,5 +1,9 @@
 import { runTaskByType } from "../lib/task-service";
 
+export const config = {
+  runtime: "nodejs",
+};
+
 export default async function handler(req: any, res: any) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
