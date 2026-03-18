@@ -536,6 +536,9 @@ export default function App() {
   };
 
   const getFriendlyErrorMessage = (message: string) => {
+    if (message.includes("Failed to fetch") || message.includes("ERR_TIMED_OUT")) {
+      return "提案请求超时了。已经切换为更稳的文本提案链路，刷新后再试一次通常就能恢复。";
+    }
     if (message.includes("模型或接口不存在") || message.includes("模型不可用")) {
       return `当前模型请求失败：${message}。请切换模型后重试。`;
     }
@@ -828,9 +831,40 @@ export default function App() {
     setLoadingText("正在撰写提案...");
     setTaskStatus("queued");
     try {
-      const result = await runTask<{ finalPoster: PosterItem | null }, ProposalTaskResult>("proposal", { finalPoster }, {
-        onStatusChange: (status) => setTaskStatus(status),
-      });
+      const result = await runTask<
+        {
+          finalPoster: PosterItem | null;
+          selectedTextModel: string;
+          briefSummary: {
+            subject: string;
+            audience: string;
+            channel: string;
+            tone: string;
+            prompt: string;
+            selectedStyle: string;
+            selectedRatio: string;
+          };
+        },
+        ProposalTaskResult
+      >(
+        "proposal",
+        {
+          finalPoster,
+          selectedTextModel,
+          briefSummary: {
+            subject: briefFields.subject,
+            audience: briefFields.audience,
+            channel: briefFields.channel,
+            tone: briefFields.tone,
+            prompt,
+            selectedStyle: ART_STYLES.find((style) => style.id === selectedStyle)?.label || selectedStyle,
+            selectedRatio,
+          },
+        },
+        {
+          onStatusChange: (status) => setTaskStatus(status),
+        },
+      );
       setProposalText(result.proposalText);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));

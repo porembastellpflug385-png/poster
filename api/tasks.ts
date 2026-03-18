@@ -107,6 +107,16 @@ type OptimizePosterPayload = {
 
 type GenerateProposalPayload = {
   finalPoster: PosterResult | null;
+  selectedTextModel?: string;
+  briefSummary?: {
+    subject?: string;
+    audience?: string;
+    channel?: string;
+    tone?: string;
+    prompt?: string;
+    selectedStyle?: string;
+    selectedRatio?: string;
+  };
 };
 
 function createId() {
@@ -463,24 +473,50 @@ async function runGenerateProposalTask(payload: GenerateProposalPayload) {
   if (!payload.finalPoster) {
     throw new Error("请选择定稿");
   }
+  const styleLabel = payload.briefSummary?.selectedStyle || "未设置";
+  const ratioLabel = payload.briefSummary?.selectedRatio || "未设置";
+  const contextLines = [
+    `项目主题：${payload.briefSummary?.subject || "未填写"}`,
+    `目标受众：${payload.briefSummary?.audience || "未填写"}`,
+    `投放场景：${payload.briefSummary?.channel || "未填写"}`,
+    `视觉气质：${payload.briefSummary?.tone || "未填写"}`,
+    `补充说明：${payload.briefSummary?.prompt || "无"}`,
+    `海报风格：${styleLabel}`,
+    `海报画幅：${ratioLabel}`,
+    `当前定稿描述：${payload.finalPoster.ideaText || "未提供"}`,
+  ].join("\n");
+  const content: any[] = [
+    {
+      type: "text",
+      text: `你是资深品牌策划师。请基于下面的项目信息，为这张定稿海报撰写一份专业、可直接用于汇报或交付的中文提案。
+
+${contextLines}
+
+输出结构：
+1. 设计理念
+2. 视觉分析（构图、色彩、字体/层级）
+3. 受众洞察与传播策略
+4. 应用场景与投放建议
+5. 下一步可优化方向
+
+要求：
+- 直接输出正文，不要 JSON
+- 语言专业、简洁、有提案感
+- 如果没有看到海报图像，也要基于项目上下文和定稿描述给出可信分析`,
+    },
+  ];
+  if (/^https?:\/\//i.test(payload.finalPoster.url)) {
+    content.push({ type: "image_url", image_url: { url: payload.finalPoster.url } });
+  }
   const res = await callTextModel([
     {
       role: "user",
-      content: [
-        {
-          type: "text",
-          text: `你是资深品牌策划师。为这张海报撰写专业提案：
-1. 设计理念
-2. 视觉分析（构图、色彩、字体）
-3. 受众与传播策略
-4. 应用场景
-5. 优化方向
-中文撰写，有深度。`,
-        },
-        { type: "image_url", image_url: { url: payload.finalPoster.url } },
-      ],
+      content,
     },
-  ]);
+  ], payload.selectedTextModel || TEXT_MODEL, {
+    temperature: 0.7,
+    max_tokens: 1200,
+  });
   return { proposalText: res.choices?.[0]?.message?.content || "生成失败" };
 }
 
