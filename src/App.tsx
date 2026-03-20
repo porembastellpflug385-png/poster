@@ -115,6 +115,24 @@ const REFERENCE_IMPORT_TIPS = [
   "如果复制的是 Pinterest / 花瓣详情页，系统会先尝试自动提取主图。",
   "如果自动提取失败，最稳的方式是打开大图后复制图片地址，或直接保存截图上传。",
 ];
+const REFERENCE_SEARCH_TEMPLATES = [
+  { id: "brand", label: "高级品牌海报", suffix: "luxury brand poster design" },
+  { id: "product", label: "产品主视觉", suffix: "product poster key visual" },
+  { id: "campaign", label: "活动宣传海报", suffix: "campaign poster design" },
+  { id: "social", label: "社媒封面", suffix: "social media poster design" },
+] as const;
+const COPY_LAYOUT_OPTIONS = [
+  {
+    id: "without-copy",
+    label: "无文案排版",
+    description: "画面中不允许出现任何文字、数字、水印或 logo 文案。",
+  },
+  {
+    id: "with-copy",
+    label: "有文案排版",
+    description: "先生成适合排版的背景，再用可编辑覆盖层放置标题、正文、二维码和 logo。",
+  },
+] as const;
 
 type UploadAsset = {
   id?: string;
@@ -170,6 +188,25 @@ type ProposalTaskResult = {
   proposalText: string;
 };
 
+type CopyLayoutMode = (typeof COPY_LAYOUT_OPTIONS)[number]["id"];
+type CopyOverlayType = "headline" | "subheadline" | "body" | "note" | "qr" | "logo";
+type CopyFields = {
+  headline: string;
+  subheadline: string;
+  body: string;
+  note: string;
+};
+type OverlayElement = {
+  id: string;
+  type: CopyOverlayType;
+  x: number;
+  y: number;
+  width: number;
+  fontSize?: number;
+  assetUrl?: string;
+  text?: string;
+};
+
 type BriefFieldKey = "subject" | "audience" | "channel" | "tone";
 type SummaryDataItem = {
   label: string;
@@ -180,6 +217,132 @@ type NoticeState = {
   tone: "success" | "error";
   message: string;
 } | null;
+type GenerationSnapshot = {
+  mode: "ideas" | "direct" | "optimize-existing" | "optimize-poster";
+  summary: string;
+} | null;
+
+function buildDefaultOverlays(copyFields: CopyFields, qrAsset: UploadAsset | null, logoAsset: UploadAsset | null): OverlayElement[] {
+  const overlays: OverlayElement[] = [];
+  if (copyFields.headline.trim()) {
+    overlays.push({ id: "headline", type: "headline", x: 8, y: 10, width: 54, fontSize: 58, text: copyFields.headline.trim() });
+  }
+  if (copyFields.subheadline.trim()) {
+    overlays.push({ id: "subheadline", type: "subheadline", x: 8, y: 24, width: 52, fontSize: 28, text: copyFields.subheadline.trim() });
+  }
+  if (copyFields.body.trim()) {
+    overlays.push({ id: "body", type: "body", x: 8, y: 35, width: 46, fontSize: 18, text: copyFields.body.trim() });
+  }
+  if (copyFields.note.trim()) {
+    overlays.push({ id: "note", type: "note", x: 8, y: 88, width: 42, fontSize: 14, text: copyFields.note.trim() });
+  }
+  if (logoAsset?.url) {
+    overlays.push({ id: "logo", type: "logo", x: 78, y: 8, width: 14, assetUrl: logoAsset.url });
+  }
+  if (qrAsset?.url) {
+    overlays.push({ id: "qr", type: "qr", x: 78, y: 78, width: 14, assetUrl: qrAsset.url });
+  }
+  return overlays;
+}
+
+function cloneOverlays(overlays: OverlayElement[]) {
+  return overlays.map((overlay) => ({ ...overlay }));
+}
+
+function formatCopyLayoutSummary(mode: CopyLayoutMode, overlays: OverlayElement[]) {
+  if (mode === "without-copy") {
+    return "纯视觉海报 · 画面不含任何文字元素";
+  }
+  return `可编辑文案排版 · ${overlays.length} 个版式元素`;
+}
+
+async function loadCanvasImage(url: string) {
+  const image = new Image();
+  image.crossOrigin = "anonymous";
+  image.referrerPolicy = "no-referrer";
+
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("图片加载失败，无法导出合成结果"));
+    image.src = url;
+  });
+
+  return image;
+}
+
+function PosterComposite({
+  posterUrl,
+  overlays,
+  onOverlayPointerDown,
+  onSelectOverlay,
+  selectedOverlayId,
+  editable = false,
+}: {
+  posterUrl: string;
+  overlays: OverlayElement[];
+  onOverlayPointerDown?: (event: React.PointerEvent<HTMLDivElement>, overlayId: string) => void;
+  onSelectOverlay?: (overlayId: string) => void;
+  selectedOverlayId?: string | null;
+  editable?: boolean;
+}) {
+  return (
+    <div className="relative overflow-hidden rounded-[24px] bg-[var(--surface-muted)]">
+      <img src={posterUrl} className="block w-full object-cover" />
+      <div className="pointer-events-none absolute inset-0">
+        {overlays.map((overlay) => {
+          const commonStyle: React.CSSProperties = {
+            left: `${overlay.x}%`,
+            top: `${overlay.y}%`,
+            width: `${overlay.width}%`,
+          };
+          const selected = editable && selectedOverlayId === overlay.id;
+          const className = `absolute pointer-events-auto ${selected ? "ring-2 ring-[var(--accent-strong)] ring-offset-2 ring-offset-transparent" : ""}`;
+
+          if (overlay.type === "logo" || overlay.type === "qr") {
+            return (
+              <div
+                key={overlay.id}
+                style={commonStyle}
+                onPointerDown={editable && onOverlayPointerDown ? (event) => onOverlayPointerDown(event, overlay.id) : undefined}
+                onClick={() => onSelectOverlay?.(overlay.id)}
+                className={className}
+              >
+                <img src={overlay.assetUrl} className="block w-full rounded-[12px] object-contain shadow-[var(--shadow-card)]" />
+              </div>
+            );
+          }
+
+          const textStyle: React.CSSProperties = {
+            ...commonStyle,
+            fontSize: `clamp(12px, ${overlay.fontSize || 18}px, 72px)`,
+          };
+
+          return (
+            <div
+              key={overlay.id}
+              style={textStyle}
+              onPointerDown={editable && onOverlayPointerDown ? (event) => onOverlayPointerDown(event, overlay.id) : undefined}
+              onClick={() => onSelectOverlay?.(overlay.id)}
+              className={`${className} rounded-[14px] px-2 py-1 text-white drop-shadow-[0_4px_18px_rgba(0,0,0,0.5)]`}
+            >
+              <div
+                className={`whitespace-pre-wrap break-words ${
+                  overlay.type === "headline"
+                    ? "font-semibold leading-[1.05]"
+                    : overlay.type === "subheadline"
+                      ? "font-medium leading-[1.2]"
+                      : "leading-[1.4]"
+                }`}
+              >
+                {overlay.text}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 const BRIEF_FIELD_META: { key: BriefFieldKey; label: string; placeholder: string }[] = [
   { key: "subject", label: "主题", placeholder: "例如：新品耳机上市" },
@@ -392,12 +555,24 @@ export default function App() {
     channel: "",
     tone: "",
   });
+  const [copyLayoutMode, setCopyLayoutMode] = useState<CopyLayoutMode>("without-copy");
+  const [copyFields, setCopyFields] = useState<CopyFields>({
+    headline: "",
+    subheadline: "",
+    body: "",
+    note: "",
+  });
   const [prompt, setPrompt] = useState("");
   const [styleRefImages, setStyleRefImages] = useState<UploadAsset[]>([]);
   const styleRefInputRef = useRef<HTMLInputElement>(null);
+  const logoInputRef = useRef<HTMLInputElement>(null);
+  const qrInputRef = useRef<HTMLInputElement>(null);
   const [referenceSearchInput, setReferenceSearchInput] = useState("");
   const [referenceSearchQuery, setReferenceSearchQuery] = useState("");
   const [referenceImportUrl, setReferenceImportUrl] = useState("");
+  const [activeReferenceTemplateId, setActiveReferenceTemplateId] = useState<string | null>(null);
+  const [qrAsset, setQrAsset] = useState<UploadAsset | null>(null);
+  const [logoAsset, setLogoAsset] = useState<UploadAsset | null>(null);
 
   const referenceImportHint = referenceImportUrl.trim()
     ? /^https?:\/\/.+\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(referenceImportUrl.trim())
@@ -437,6 +612,19 @@ export default function App() {
   const [showStorage, setShowStorage] = useState(false);
   const [previewImg, setPreviewImg] = useState<string | null>(null);
   const [notice, setNotice] = useState<NoticeState>(null);
+  const [generationSnapshot, setGenerationSnapshot] = useState<GenerationSnapshot>(null);
+  const [posterOverlays, setPosterOverlays] = useState<Record<string, OverlayElement[]>>({});
+  const [editingPosterId, setEditingPosterId] = useState<string | null>(null);
+  const [selectedOverlayId, setSelectedOverlayId] = useState<string | null>(null);
+  const dragStateRef = useRef<{
+    posterId: string;
+    overlayId: string;
+    startX: number;
+    startY: number;
+    initialX: number;
+    initialY: number;
+    containerRect: DOMRect;
+  } | null>(null);
 
   useEffect(() => {
     try {
@@ -459,6 +647,42 @@ export default function App() {
     const timer = window.setTimeout(() => setNotice(null), 2600);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  useEffect(() => {
+    const handlePointerMove = (event: PointerEvent) => {
+      const drag = dragStateRef.current;
+      if (!drag) return;
+      const dx = ((event.clientX - drag.startX) / drag.containerRect.width) * 100;
+      const dy = ((event.clientY - drag.startY) / drag.containerRect.height) * 100;
+      setPosterOverlays((prev) => {
+        const list = prev[drag.posterId];
+        if (!list) return prev;
+        return {
+          ...prev,
+          [drag.posterId]: list.map((overlay) =>
+            overlay.id === drag.overlayId
+              ? {
+                  ...overlay,
+                  x: Math.max(0, Math.min(100 - overlay.width, drag.initialX + dx)),
+                  y: Math.max(0, Math.min(100, drag.initialY + dy)),
+                }
+              : overlay,
+          ),
+        };
+      });
+    };
+
+    const handlePointerUp = () => {
+      dragStateRef.current = null;
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, []);
 
   const addToStorage = useCallback((url: string, label = "海报") => {
     const item = { id: Date.now().toString() + Math.random().toString(36).slice(2), url, label, timestamp: Date.now() };
@@ -501,6 +725,27 @@ export default function App() {
     handleMultiAssetUpload(e, setRefImages);
   };
 
+  const handleSingleAssetUpload = (
+    e: React.ChangeEvent<HTMLInputElement>,
+    setter: React.Dispatch<React.SetStateAction<UploadAsset | null>>,
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = reader.result as string;
+      setter({
+        id: Date.now().toString() + Math.random().toString(36).slice(2),
+        mimeType: file.type,
+        data: result.split(",")[1],
+        url: result,
+        name: file.name,
+      });
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
   const downloadImage = (url: string, filename: string) => {
     const link = document.createElement("a");
     link.href = url;
@@ -509,6 +754,97 @@ export default function App() {
     link.click();
     document.body.removeChild(link);
     setNotice({ tone: "success", message: `已开始下载 ${filename}` });
+  };
+
+  const renderPosterWithOverlays = async (
+    posterUrl: string,
+    overlays: OverlayElement[],
+    outputSize?: { width: number; height: number },
+  ) => {
+    const image = await loadCanvasImage(posterUrl);
+    const width = outputSize?.width || image.width;
+    const height = outputSize?.height || image.height;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("浏览器不支持导出画布");
+    }
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+
+    const baseScale = Math.min(width / image.width, height / image.height);
+    const baseWidth = image.width * baseScale;
+    const baseHeight = image.height * baseScale;
+    const baseX = (width - baseWidth) / 2;
+    const baseY = (height - baseHeight) / 2;
+    ctx.drawImage(image, baseX, baseY, baseWidth, baseHeight);
+
+    for (const overlay of overlays) {
+      const x = baseX + (overlay.x / 100) * baseWidth;
+      const y = baseY + (overlay.y / 100) * baseHeight;
+      const overlayWidth = (overlay.width / 100) * baseWidth;
+
+      if ((overlay.type === "logo" || overlay.type === "qr") && overlay.assetUrl) {
+        const assetImage = await loadCanvasImage(overlay.assetUrl);
+        const assetHeight = overlayWidth * (assetImage.height / assetImage.width);
+        ctx.drawImage(assetImage, x, y, overlayWidth, assetHeight);
+        continue;
+      }
+
+      if (!overlay.text) continue;
+      const fontSize = (overlay.fontSize || 18) * (baseWidth / 1200);
+      ctx.font = `${overlay.type === "headline" ? "700" : overlay.type === "subheadline" ? "600" : "500"} ${fontSize}px "SF Pro Display", "Helvetica Neue", sans-serif`;
+      ctx.fillStyle = "#ffffff";
+      ctx.textBaseline = "top";
+      ctx.shadowColor = "rgba(0,0,0,0.45)";
+      ctx.shadowBlur = 18;
+      ctx.shadowOffsetY = 4;
+
+      const lineHeight = fontSize * (overlay.type === "headline" ? 1.08 : 1.35);
+      const charsPerLine = Math.max(6, Math.floor(overlayWidth / Math.max(fontSize * 0.62, 10)));
+      const paragraphs = overlay.text.split("\n");
+      let currentY = y;
+      paragraphs.forEach((paragraph) => {
+        const lines = paragraph.match(new RegExp(`.{1,${charsPerLine}}`, "g")) || [paragraph];
+        lines.forEach((line) => {
+          ctx.fillText(line, x, currentY, overlayWidth);
+          currentY += lineHeight;
+        });
+      });
+      ctx.shadowColor = "transparent";
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetY = 0;
+    }
+
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png", 1));
+    if (!blob) {
+      throw new Error("导出文件生成失败");
+    }
+    return blob;
+  };
+
+  const downloadPosterAsset = async (
+    posterUrl: string,
+    filename: string,
+    overlays: OverlayElement[] = [],
+    outputSize?: { width: number; height: number },
+  ) => {
+    if (!overlays.length) {
+      if (!outputSize) {
+        downloadImage(posterUrl, filename);
+        return;
+      }
+      await downloadResizedImage(posterUrl, filename, outputSize);
+      return;
+    }
+
+    const blob = await renderPosterWithOverlays(posterUrl, overlays, outputSize);
+    const objectUrl = URL.createObjectURL(blob);
+    downloadImage(objectUrl, filename);
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   };
 
   const downloadResizedImage = async (
@@ -638,6 +974,27 @@ export default function App() {
     return lines.join("\n");
   };
 
+  const buildCopyPrompt = () => {
+    if (copyLayoutMode === "without-copy") {
+      return "版式要求：画面中绝对不允许出现任何文字、数字、logo 文案、水印、招牌或可识别字符。";
+    }
+    const contentLines = [
+      copyFields.headline ? `主标题：${copyFields.headline}` : "",
+      copyFields.subheadline ? `副标题：${copyFields.subheadline}` : "",
+      copyFields.body ? `正文：${copyFields.body}` : "",
+      copyFields.note ? `备注：${copyFields.note}` : "",
+      qrAsset ? "需要二维码位" : "",
+      logoAsset ? "需要 logo 位" : "",
+    ].filter(Boolean);
+    return [
+      "版式要求：需要有文案排版空间，但不要在海报背景里硬生成真实文字。",
+      "请预留清晰、专业、可编辑的文案安全区，后续文案将由前端覆盖层叠加。",
+      contentLines.length ? `排版内容参考：${contentLines.join("；")}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  };
+
   const buildReferenceSearchQuery = () => {
     const subject = referenceSearchInput.trim() || briefFields.subject.trim();
     const keywords = [
@@ -648,6 +1005,35 @@ export default function App() {
       "poster design reference",
     ].filter(Boolean);
     return keywords.join(" ");
+  };
+
+  const buildGenerationSnapshot = (mode: NonNullable<GenerationSnapshot>["mode"]) => {
+    const styleLabel = ART_STYLES.find((style) => style.id === selectedStyle)?.label || selectedStyle;
+    const brief = [briefFields.subject, briefFields.channel, briefFields.tone].filter(Boolean).join(" / ") || "未填写简报";
+    const references = styleRefImages.length ? `参考图 ${styleRefImages.length} 张` : "未使用参考图";
+    const copySummary = formatCopyLayoutSummary(copyLayoutMode, buildDefaultOverlays(copyFields, qrAsset, logoAsset));
+    return {
+      mode,
+      summary: `${styleLabel} · ${selectedRatio} · ${references} · ${copySummary} · ${brief}`,
+    };
+  };
+
+  const assignOverlaysToPosters = (items: PosterItem[]) => {
+    if (copyLayoutMode !== "with-copy") return;
+    const baseOverlays = buildDefaultOverlays(copyFields, qrAsset, logoAsset);
+    if (!baseOverlays.length) return;
+    setPosterOverlays((prev) => {
+      const next = { ...prev };
+      items.forEach((item) => {
+        next[item.id] = cloneOverlays(baseOverlays);
+      });
+      return next;
+    });
+  };
+
+  const openOverlayEditor = (poster: PosterItem) => {
+    setEditingPosterId(poster.id);
+    setSelectedOverlayId((posterOverlays[poster.id] && posterOverlays[poster.id][0]?.id) || null);
   };
 
   const decorateGeneratedPosters = (
@@ -690,6 +1076,16 @@ export default function App() {
     setError("");
   };
 
+  const applyReferenceSearchTemplate = (templateId: string) => {
+    const template = REFERENCE_SEARCH_TEMPLATES.find((item) => item.id === templateId);
+    if (!template) return;
+    const subject = referenceSearchInput.trim() || briefFields.subject.trim() || "poster";
+    setActiveReferenceTemplateId(templateId);
+    setReferenceSearchInput(subject);
+    setReferenceSearchQuery([subject, briefFields.channel.trim(), briefFields.tone.trim(), template.suffix].filter(Boolean).join(" "));
+    setError("");
+  };
+
   const importReferenceUrl = () => {
     const url = referenceImportUrl.trim();
     if (!/^https?:\/\//i.test(url)) {
@@ -712,6 +1108,9 @@ export default function App() {
   const comparedPosters = compareSelection
     .map((posterId) => posters.find((poster) => poster.id === posterId))
     .filter(Boolean) as PosterItem[];
+  const editingPoster = editingPosterId ? posters.find((poster) => poster.id === editingPosterId) || null : null;
+  const editingOverlays = editingPosterId ? posterOverlays[editingPosterId] || [] : [];
+  const selectedOverlay = editingOverlays.find((overlay) => overlay.id === selectedOverlayId) || null;
   const filteredPosters = posters.filter((poster) => {
     if (resultFilter === "all") return true;
     if (resultFilter === "latest") return latestBatchId ? poster.batchId === latestBatchId : false;
@@ -728,8 +1127,35 @@ export default function App() {
     { label: "当前定稿", value: finalPoster?.ideaText || "尚未选择" },
   ];
 
+  const handleOverlayPointerDown = (event: React.PointerEvent<HTMLDivElement>, posterId: string, overlayId: string) => {
+    const container = event.currentTarget.closest("[data-overlay-stage]");
+    if (!container) return;
+    const overlay = (posterOverlays[posterId] || []).find((item) => item.id === overlayId);
+    if (!overlay) return;
+    dragStateRef.current = {
+      posterId,
+      overlayId,
+      startX: event.clientX,
+      startY: event.clientY,
+      initialX: overlay.x,
+      initialY: overlay.y,
+      containerRect: container.getBoundingClientRect(),
+    };
+    setSelectedOverlayId(overlayId);
+  };
+
+  const updateSelectedOverlay = (patch: Partial<OverlayElement>) => {
+    if (!editingPosterId || !selectedOverlayId) return;
+    setPosterOverlays((prev) => ({
+      ...prev,
+      [editingPosterId]: (prev[editingPosterId] || []).map((overlay) =>
+        overlay.id === selectedOverlayId ? { ...overlay, ...patch } : overlay,
+      ),
+    }));
+  };
+
   const generateIdeas = async () => {
-    const creativeBrief = buildCreativeBrief();
+    const creativeBrief = [buildCreativeBrief(), buildCopyPrompt()].filter(Boolean).join("\n");
     if (!creativeBrief.trim() && !styleRefImages.length) {
       setError("请输入需求或上传参考图");
       return;
@@ -740,7 +1166,14 @@ export default function App() {
     setTaskStatus("queued");
     try {
       const result = await runTask<
-        { prompt: string; selectedStyle: string; selectedRatio: string; styleRefImages: UploadAsset[]; selectedTextModel: string; ideaCount: number },
+        {
+          prompt: string;
+          selectedStyle: string;
+          selectedRatio: string;
+          styleRefImages: UploadAsset[];
+          selectedTextModel: string;
+          ideaCount: number;
+        },
         IdeasTaskResult
       >("ideas", {
         prompt: creativeBrief,
@@ -754,6 +1187,7 @@ export default function App() {
       });
       setIdeas(result.ideas);
       setSelectedIdeas([]);
+      setGenerationSnapshot(buildGenerationSnapshot("ideas"));
       setStep(2);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
@@ -765,7 +1199,7 @@ export default function App() {
   };
 
   const directGeneratePosters = async () => {
-    const creativeBrief = buildCreativeBrief();
+    const creativeBrief = [buildCreativeBrief(), buildCopyPrompt()].filter(Boolean).join("\n");
     if (!creativeBrief.trim() && !styleRefImages.length) {
       setError("请输入需求或上传参考图");
       return;
@@ -784,6 +1218,7 @@ export default function App() {
           selectedModel: string;
           imageCount: number;
           referenceImages: UploadAsset[];
+          copyLayoutMode: CopyLayoutMode;
         },
         PostersTaskResult
       >(
@@ -796,6 +1231,7 @@ export default function App() {
           selectedModel,
           imageCount,
           referenceImages: styleRefImages,
+          copyLayoutMode,
         },
         {
           onStatusChange: (status) => setTaskStatus(status),
@@ -807,6 +1243,8 @@ export default function App() {
         sourceType: "ideas",
       });
       setPosters((prev) => [...generated, ...prev]);
+      assignOverlaysToPosters(generated);
+      setGenerationSnapshot(buildGenerationSnapshot("direct"));
       setStep(3);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
@@ -853,6 +1291,10 @@ export default function App() {
         sourceType: "optimize-existing",
       });
       setPosters((prev) => [...generated, ...prev]);
+      setGenerationSnapshot({
+        mode: "optimize-existing",
+        summary: `${uploadedPosters.length} 张原图 · ${selectedRatio} · ${imageCount} 个优化版本`,
+      });
       setStep(3);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
@@ -882,6 +1324,7 @@ export default function App() {
           selectedModel: string;
           imageCount: number;
           referenceImages: UploadAsset[];
+          copyLayoutMode: CopyLayoutMode;
         },
         PostersTaskResult
       >("generate-posters", {
@@ -892,6 +1335,7 @@ export default function App() {
         selectedModel,
         imageCount,
         referenceImages: styleRefImages,
+        copyLayoutMode,
       }, {
         onStatusChange: (status) => setTaskStatus(status),
       });
@@ -905,6 +1349,8 @@ export default function App() {
         sourceType: "ideas",
       });
       setPosters((prev) => [...generated, ...prev]);
+      assignOverlaysToPosters(generated);
+      setGenerationSnapshot(buildGenerationSnapshot("ideas"));
       setStep(3);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
@@ -963,6 +1409,10 @@ export default function App() {
         sourceType: "optimize-poster",
       });
       setPosters((prev) => [...generated, ...prev]);
+      setGenerationSnapshot({
+        mode: "optimize-poster",
+        summary: `${ART_STYLES.find((style) => style.id === selectedStyle)?.label || selectedStyle} · ${selectedRatio} · 反馈重点 ${feedbackFocuses.join("、") || "自然语言"}`,
+      });
       setFeedbackText("");
       setFeedbackFocuses([]);
       setStep(3);
@@ -1058,6 +1508,108 @@ export default function App() {
             <X size={20} />
           </button>
           <img src={previewImg} className="max-h-full max-w-full rounded-[28px] object-contain shadow-2xl" />
+        </div>
+      ) : null}
+
+      {editingPoster ? (
+        <div className="fixed inset-0 z-[92] flex items-center justify-center bg-black/70 p-4 backdrop-blur-xl">
+          <div className="glass-panel grid max-h-[92vh] w-full max-w-6xl gap-4 overflow-hidden rounded-[32px] p-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="min-h-0 overflow-auto rounded-[24px] bg-[var(--surface-muted)] p-4">
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-[var(--text-primary)]">文案排版编辑器</p>
+                  <p className="mt-1 text-xs text-[var(--text-secondary)]">支持拖拽位置与缩放大小，先完成最常用的基础排版调整。</p>
+                </div>
+                <button
+                  onClick={() => {
+                    setEditingPosterId(null);
+                    setSelectedOverlayId(null);
+                  }}
+                  className="rounded-full bg-[var(--surface-elevated)] p-2 text-[var(--text-primary)]"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div data-overlay-stage>
+                <PosterComposite
+                  posterUrl={editingPoster.url}
+                  overlays={editingOverlays}
+                  selectedOverlayId={selectedOverlayId}
+                  editable
+                  onSelectOverlay={setSelectedOverlayId}
+                  onOverlayPointerDown={(event, overlayId) => handleOverlayPointerDown(event, editingPoster.id, overlayId)}
+                />
+              </div>
+            </div>
+            <div className="min-h-0 overflow-auto rounded-[24px] bg-[var(--surface-muted)] p-5">
+              <p className="text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">排版控件</p>
+              {selectedOverlay ? (
+                <div className="mt-4 space-y-4">
+                  <div>
+                    <p className="text-sm font-semibold text-[var(--text-primary)]">当前元素</p>
+                    <p className="mt-1 text-sm text-[var(--text-secondary)]">{selectedOverlay.type}</p>
+                  </div>
+                  {selectedOverlay.text !== undefined ? (
+                    <label className="block">
+                      <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">文案内容</span>
+                      <textarea
+                        value={selectedOverlay.text}
+                        onChange={(e) => updateSelectedOverlay({ text: e.target.value })}
+                        className="soft-input h-28 w-full rounded-[18px] px-4 py-3 text-sm resize-none"
+                      />
+                    </label>
+                  ) : null}
+                  <label className="block">
+                    <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">
+                      {selectedOverlay.text !== undefined ? "字体大小" : "元素宽度"}
+                    </span>
+                    <input
+                      type="range"
+                      min={selectedOverlay.text !== undefined ? 12 : 8}
+                      max={selectedOverlay.text !== undefined ? 96 : 28}
+                      value={selectedOverlay.text !== undefined ? selectedOverlay.fontSize || 18 : selectedOverlay.width}
+                      onChange={(e) =>
+                        updateSelectedOverlay(
+                          selectedOverlay.text !== undefined
+                            ? { fontSize: Number(e.target.value) }
+                            : { width: Number(e.target.value) },
+                        )
+                      }
+                      className="w-full"
+                    />
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">X</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={90}
+                        value={selectedOverlay.x}
+                        onChange={(e) => updateSelectedOverlay({ x: Number(e.target.value) })}
+                        className="w-full"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">Y</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={95}
+                        value={selectedOverlay.y}
+                        onChange={(e) => updateSelectedOverlay({ y: Number(e.target.value) })}
+                        className="w-full"
+                      />
+                    </label>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-4 rounded-[18px] border border-dashed border-[var(--border-subtle)] px-4 py-10 text-sm text-[var(--text-secondary)]">
+                  点选海报上的文字、二维码或 logo，就可以开始拖拽和缩放。
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       ) : null}
 
@@ -1438,6 +1990,100 @@ export default function App() {
 
                     <div>
                       <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
+                        文案排版策略
+                      </label>
+                      <div className="grid gap-3 md:grid-cols-2">
+                        {COPY_LAYOUT_OPTIONS.map((option) => {
+                          const active = copyLayoutMode === option.id;
+                          return (
+                            <button
+                              key={option.id}
+                              onClick={() => setCopyLayoutMode(option.id)}
+                              className={`rounded-[24px] border p-4 text-left transition ${
+                                active
+                                  ? "border-transparent bg-[var(--accent-soft)]"
+                                  : "border-[var(--border-subtle)] bg-[var(--surface-muted)] hover:bg-[var(--surface-strong)]"
+                              }`}
+                            >
+                              <div className="text-sm font-semibold text-[var(--text-primary)]">{option.label}</div>
+                              <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">{option.description}</p>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {copyLayoutMode === "with-copy" ? (
+                      <div className="space-y-4 rounded-[24px] bg-[var(--surface-muted)] p-4">
+                        <div>
+                          <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
+                            文案排版内容
+                          </label>
+                          <div className="grid gap-3">
+                            <input
+                              value={copyFields.headline}
+                              onChange={(e) => setCopyFields((prev) => ({ ...prev, headline: e.target.value }))}
+                              placeholder="主标题"
+                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
+                            />
+                            <input
+                              value={copyFields.subheadline}
+                              onChange={(e) => setCopyFields((prev) => ({ ...prev, subheadline: e.target.value }))}
+                              placeholder="副标题"
+                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
+                            />
+                            <textarea
+                              value={copyFields.body}
+                              onChange={(e) => setCopyFields((prev) => ({ ...prev, body: e.target.value }))}
+                              placeholder="正文"
+                              className="soft-input h-28 w-full rounded-[20px] px-4 py-3 text-sm resize-none"
+                            />
+                            <input
+                              value={copyFields.note}
+                              onChange={(e) => setCopyFields((prev) => ({ ...prev, note: e.target.value }))}
+                              placeholder="备注"
+                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          <button
+                            onClick={() => qrInputRef.current?.click()}
+                            className="rounded-[20px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-elevated)] px-4 py-4 text-left transition hover:bg-[var(--surface-strong)]"
+                          >
+                            <input
+                              type="file"
+                              accept="image/*"
+                              ref={qrInputRef}
+                              className="hidden"
+                              onChange={(e) => handleSingleAssetUpload(e, setQrAsset)}
+                            />
+                            <div className="text-sm font-semibold text-[var(--text-primary)]">二维码区</div>
+                            <div className="mt-1 text-xs text-[var(--text-secondary)]">{qrAsset ? qrAsset.name : "上传二维码图片"}</div>
+                          </button>
+                          <button
+                            onClick={() => logoInputRef.current?.click()}
+                            className="rounded-[20px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-elevated)] px-4 py-4 text-left transition hover:bg-[var(--surface-strong)]"
+                          >
+                            <input
+                              type="file"
+                              accept="image/*"
+                              ref={logoInputRef}
+                              className="hidden"
+                              onChange={(e) => handleSingleAssetUpload(e, setLogoAsset)}
+                            />
+                            <div className="text-sm font-semibold text-[var(--text-primary)]">Logo 区</div>
+                            <div className="mt-1 text-xs text-[var(--text-secondary)]">{logoAsset ? logoAsset.name : "上传 logo 图片"}</div>
+                          </button>
+                        </div>
+                        <p className="text-xs text-[var(--text-tertiary)]">
+                          当前模式下，背景图会预留排版安全区，文案、二维码和 logo 将在生成后作为可拖拽覆盖层进行调整。
+                        </p>
+                      </div>
+                    ) : null}
+
+                    <div>
+                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
                         风格参考
                       </label>
                       <button
@@ -1491,6 +2137,24 @@ export default function App() {
                         参考搜索
                       </label>
                       <div className="space-y-3 rounded-[24px] bg-[var(--surface-muted)] p-4">
+                        <div>
+                          <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">常用搜索模板</p>
+                          <div className="flex flex-wrap gap-2">
+                            {REFERENCE_SEARCH_TEMPLATES.map((template) => (
+                              <button
+                                key={template.id}
+                                onClick={() => applyReferenceSearchTemplate(template.id)}
+                                className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                                  activeReferenceTemplateId === template.id
+                                    ? "bg-[var(--accent-strong)] text-white"
+                                    : "bg-[var(--surface-strong)] text-[var(--text-secondary)] hover:bg-[var(--surface-elevated)] hover:text-[var(--text-primary)]"
+                                }`}
+                              >
+                                {template.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
                         <div className="flex flex-col gap-3 md:flex-row">
                           <input
                             value={referenceSearchInput}
@@ -1828,6 +2492,9 @@ export default function App() {
                         <p className="mt-1 text-sm text-[var(--text-secondary)]">
                           先勾选最多 2 张进入对比，再决定继续优化或设为定稿。
                         </p>
+                        {generationSnapshot ? (
+                          <p className="mt-2 text-xs text-[var(--text-tertiary)]">本轮生成摘要：{generationSnapshot.summary}</p>
+                        ) : null}
                       </div>
                       <div className="flex gap-2">
                         <button
@@ -1972,6 +2639,14 @@ export default function App() {
                                     设为定稿
                                   </button>
                                 </div>
+                                {copyLayoutMode === "with-copy" && posterOverlays[poster.id]?.length ? (
+                                  <button
+                                    onClick={() => openOverlayEditor(poster)}
+                                    className="w-full rounded-full bg-[var(--surface-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                                  >
+                                    编辑文案排版
+                                  </button>
+                                ) : null}
                                 <div className="flex gap-2">
                                   <button
                                     onClick={() => setPreviewImg(poster.url)}
@@ -2004,11 +2679,17 @@ export default function App() {
                 <WorkbenchCard title="当前版本" subtitle="下一轮可把这里升级为多版本对比与分支管理。">
                   {activePoster ? (
                     <div className="overflow-hidden rounded-[28px] bg-[var(--surface-muted)] p-4">
-                      <img
-                        src={activePoster.url}
-                        className="w-full rounded-[24px] object-cover shadow-[var(--shadow-card)]"
-                        onClick={() => setPreviewImg(activePoster.url)}
-                      />
+                      {posterOverlays[activePoster.id]?.length ? (
+                        <div data-overlay-stage>
+                          <PosterComposite posterUrl={activePoster.url} overlays={posterOverlays[activePoster.id]} />
+                        </div>
+                      ) : (
+                        <img
+                          src={activePoster.url}
+                          className="w-full rounded-[24px] object-cover shadow-[var(--shadow-card)]"
+                          onClick={() => setPreviewImg(activePoster.url)}
+                        />
+                      )}
                       <div className="mt-4 flex flex-wrap gap-2">
                         <span className="rounded-full bg-[var(--surface-strong)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)]">
                           {activePoster.sourceLabel || "结果"}
@@ -2017,6 +2698,14 @@ export default function App() {
                           <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]">
                             来自本轮
                           </span>
+                        ) : null}
+                        {posterOverlays[activePoster.id]?.length ? (
+                          <button
+                            onClick={() => openOverlayEditor(activePoster)}
+                            className="rounded-full bg-[var(--surface-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-primary)]"
+                          >
+                            编辑文案排版
+                          </button>
                         ) : null}
                       </div>
                     </div>
@@ -2145,15 +2834,31 @@ export default function App() {
                   {finalPoster ? (
                     <div className="space-y-4">
                       <div className="overflow-hidden rounded-[28px] bg-[var(--surface-muted)] p-4">
-                        <img
-                          src={finalPoster.url}
-                          className="w-full rounded-[24px] object-contain shadow-[var(--shadow-card)]"
-                          onClick={() => setPreviewImg(finalPoster.url)}
-                        />
+                        {posterOverlays[finalPoster.id]?.length ? (
+                          <div data-overlay-stage>
+                            <PosterComposite posterUrl={finalPoster.url} overlays={posterOverlays[finalPoster.id]} />
+                          </div>
+                        ) : (
+                          <img
+                            src={finalPoster.url}
+                            className="w-full rounded-[24px] object-contain shadow-[var(--shadow-card)]"
+                            onClick={() => setPreviewImg(finalPoster.url)}
+                          />
+                        )}
                       </div>
                       <div className="flex gap-3">
                         <button
-                          onClick={() => downloadImage(finalPoster.url, `${buildFileBaseName()}-master.png`)}
+                          onClick={async () => {
+                            try {
+                              await downloadPosterAsset(
+                                finalPoster.url,
+                                `${buildFileBaseName()}-master.png`,
+                                posterOverlays[finalPoster.id] || [],
+                              );
+                            } catch (err: any) {
+                              setNotice({ tone: "error", message: err.message || "导出失败，请重试" });
+                            }
+                          }}
                           className="rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white"
                         >
                           <Download size={14} className="mr-2 inline" />
@@ -2172,6 +2877,14 @@ export default function App() {
                         >
                           返回结果区
                         </button>
+                        {posterOverlays[finalPoster.id]?.length ? (
+                          <button
+                            onClick={() => openOverlayEditor(finalPoster)}
+                            className="rounded-full bg-[var(--surface-elevated)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)]"
+                          >
+                            编辑文案排版
+                          </button>
+                        ) : null}
                       </div>
 
                       <div className="rounded-[24px] bg-[var(--surface-muted)] p-4">
@@ -2188,7 +2901,12 @@ export default function App() {
                               key={preset.id}
                               onClick={async () => {
                                 try {
-                                  await downloadResizedImage(finalPoster.url, `${buildFileBaseName()}-${preset.suffix}.png`, preset);
+                                  await downloadPosterAsset(
+                                    finalPoster.url,
+                                    `${buildFileBaseName()}-${preset.suffix}.png`,
+                                    posterOverlays[finalPoster.id] || [],
+                                    preset,
+                                  );
                                 } catch (err: any) {
                                   setNotice({ tone: "error", message: err.message || "导出失败，请重试" });
                                 }

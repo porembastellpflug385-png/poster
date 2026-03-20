@@ -85,6 +85,7 @@ type GeneratePostersPayload = {
   selectedModel: string;
   imageCount?: number;
   referenceImages?: UploadAsset[];
+  copyLayoutMode?: "with-copy" | "without-copy";
 };
 
 type OptimizeExistingPayload = {
@@ -464,13 +465,17 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
     .map((asset) => buildMjAssetUrl(asset))
     .filter(Boolean) as string[];
   const activeReferenceImages = payload.selectedModel.startsWith("mj_") ? mjReferenceImages : referenceImages;
+  const copyInstruction =
+    payload.copyLayoutMode === "with-copy"
+      ? "Reserve clean, professional copy-safe areas for editable headline, subheadline, body, note, logo and QR placements. Do not render any legible text, letters, numbers, watermarks or logos into the background image itself."
+      : "Do not include any letters, words, numbers, logos, watermarks, signage or readable typography anywhere in the image.";
 
   for (const idx of payload.selectedIdeas) {
     const idea = payload.ideas[idx];
     const variants = await Promise.all(
       Array.from({ length: imageCount }, (_, index) =>
         generateImage(
-          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. High quality poster. Variation ${index + 1}.`,
+          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${copyInstruction} High quality poster. Variation ${index + 1}.`,
           payload.selectedModel,
           payload.selectedRatio,
           activeReferenceImages,
