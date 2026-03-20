@@ -166,6 +166,71 @@ function buildMjAssetUrl(asset: UploadAsset) {
   return url.startsWith("data:") ? url : null;
 }
 
+function extractMetaImageFromHtml(html: string, baseUrl: string) {
+  const patterns = [
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) {
+      try {
+        return new URL(match[1], baseUrl).toString();
+      } catch {
+        return match[1];
+      }
+    }
+  }
+
+  return null;
+}
+
+async function resolveRemoteReferenceUrl(url: string) {
+  const response = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Mozilla/5.0 PosterTool/1.0",
+      Accept: "text/html,image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`参考链接读取失败 (${response.status})`);
+  }
+
+  const contentType = (response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (contentType.startsWith("image/")) {
+    return response.url || url;
+  }
+
+  if (contentType === "text/html" || contentType === "application/xhtml+xml") {
+    const html = await response.text();
+    const imageUrl = extractMetaImageFromHtml(html, response.url || url);
+    if (imageUrl) {
+      return imageUrl;
+    }
+    throw new Error("参考链接是网页，不是图片直链。请改用图片地址，或先把参考图保存后上传。");
+  }
+
+  throw new Error(`参考链接类型不支持：${contentType || "unknown"}`);
+}
+
+async function buildReferenceAssetUrl(asset: UploadAsset) {
+  if (asset.data && asset.mimeType) {
+    return `data:${asset.mimeType};base64,${asset.data}`;
+  }
+
+  if (/^https?:\/\//i.test(asset.url)) {
+    return resolveRemoteReferenceUrl(asset.url);
+  }
+
+  return asset.url;
+}
+
 async function readErrorMessage(res: Response, fallback: string) {
   try {
     const data = await res.json();
@@ -370,7 +435,11 @@ ${payload.selectedStyle === "smart" && payload.styleRefImages?.length ? "根据�
     },
   ];
   payload.styleRefImages?.forEach((img) => {
-    content.push({ type: "image_url", image_url: { url: buildAssetUrl(img) } });
+    // populated below after resolving remote pages into real image URLs when possible
+  });
+  const resolvedStyleRefs = await Promise.all((payload.styleRefImages || []).map((img) => buildReferenceAssetUrl(img)));
+  resolvedStyleRefs.forEach((url) => {
+    content.push({ type: "image_url", image_url: { url } });
   });
   const res = await callTextModel([{ role: "user", content }], payload.selectedTextModel || TEXT_MODEL, {
     response_format: { type: "json_object" },
@@ -390,7 +459,7 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
   const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const posters: PosterResult[] = [];
-  const referenceImages = (payload.referenceImages || []).map((asset) => buildAssetUrl(asset));
+  const referenceImages = await Promise.all((payload.referenceImages || []).map((asset) => buildReferenceAssetUrl(asset)));
   const mjReferenceImages = (payload.referenceImages || [])
     .map((asset) => buildMjAssetUrl(asset))
     .filter(Boolean) as string[];

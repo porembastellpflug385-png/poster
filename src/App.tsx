@@ -110,6 +110,11 @@ const REFERENCE_SEARCH_PROVIDERS = [
     buildUrl: (query: string) => `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(query)}`,
   },
 ] as const;
+const REFERENCE_IMPORT_TIPS = [
+  "优先使用图片直链，通常以 .jpg、.jpeg、.png、.webp 结尾。",
+  "如果复制的是 Pinterest / 花瓣详情页，系统会先尝试自动提取主图。",
+  "如果自动提取失败，最稳的方式是打开大图后复制图片地址，或直接保存截图上传。",
+];
 
 type UploadAsset = {
   id?: string;
@@ -394,6 +399,14 @@ export default function App() {
   const [referenceSearchQuery, setReferenceSearchQuery] = useState("");
   const [referenceImportUrl, setReferenceImportUrl] = useState("");
 
+  const referenceImportHint = referenceImportUrl.trim()
+    ? /^https?:\/\/.+\.(png|jpe?g|webp|gif)(\?.*)?$/i.test(referenceImportUrl.trim())
+      ? "看起来像图片直链，可以直接作为风格参考。"
+      : /pinterest\.|huaban\.|behance\.|dribbble\.|google\./i.test(referenceImportUrl.trim())
+        ? "看起来像网页链接，系统会尝试自动提取主图。"
+        : "如果这不是图片直链，建议改用图片地址或直接上传截图。"
+    : "";
+
   const [uploadedPosters, setUploadedPosters] = useState<UploadAsset[]>([]);
   const [optimizeFeedback, setOptimizeFeedback] = useState("");
   const uploadPosterRef = useRef<HTMLInputElement>(null);
@@ -581,6 +594,9 @@ export default function App() {
     if (message.includes("Failed to fetch") || message.includes("ERR_TIMED_OUT")) {
       return "提案请求超时了。已经切换为更稳的文本提案链路，刷新后再试一次通常就能恢复。";
     }
+    if (message.includes("参考链接是网页") || message.includes("参考链接类型不支持") || message.includes("mime type is not supported")) {
+      return "当前参考链接不是可直接识别的图片。系统会优先自动提取网页里的主图；如果仍失败，请改用图片直链，或把参考图保存后上传。";
+    }
     if (message.includes("模型或接口不存在") || message.includes("模型不可用")) {
       return `当前模型请求失败：${message}。请切换模型后重试。`;
     }
@@ -756,7 +772,7 @@ export default function App() {
     }
     setLoading(true);
     setError("");
-    setLoadingText(`正在根据当前需求直接生成 ${imageCount} 张海报...`);
+    setLoadingText(`正在使用 ${IMAGE_MODELS.find((model) => model.id === selectedModel)?.label || "当前模型"} 直接生成 ${imageCount} 张海报...`);
     setTaskStatus("queued");
     try {
       const result = await runTask<
@@ -1444,6 +1460,15 @@ export default function App() {
                                 <span className="absolute -left-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-strong)] text-[10px] font-semibold text-white">
                                   {index + 1}
                                 </span>
+                                <button
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    setStyleRefImages((prev) => prev.filter((item) => item.id !== img.id));
+                                  }}
+                                  className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-white"
+                                >
+                                  <X size={10} />
+                                </button>
                               </div>
                             ))}
                           </div>
@@ -1521,6 +1546,17 @@ export default function App() {
                             >
                               加入风格参考
                             </button>
+                          </div>
+                          {referenceImportHint ? (
+                            <p className="mt-3 text-xs text-[var(--accent-strong)]">{referenceImportHint}</p>
+                          ) : null}
+                          <div className="mt-4 rounded-[16px] bg-[var(--surface-muted)] px-4 py-3">
+                            <p className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">导入建议</p>
+                            <div className="mt-3 space-y-2 text-xs leading-5 text-[var(--text-secondary)]">
+                              {REFERENCE_IMPORT_TIPS.map((tip) => (
+                                <p key={tip}>{tip}</p>
+                              ))}
+                            </div>
                           </div>
                         </div>
                       </div>
