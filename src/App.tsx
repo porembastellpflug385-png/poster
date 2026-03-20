@@ -78,11 +78,43 @@ const IDEA_COUNT_OPTIONS = [2, 4, 6] as const;
 const IMAGE_COUNT_OPTIONS = [1, 2, 3] as const;
 const STORAGE_KEY = "poster_storage";
 const MAX_PERSISTED_STORAGE_ITEMS = 24;
+const REFERENCE_SEARCH_PROVIDERS = [
+  {
+    id: "pinterest",
+    label: "Pinterest",
+    description: "适合找风格、构图和氛围参考",
+    buildUrl: (query: string) => `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(query)}`,
+  },
+  {
+    id: "huaban",
+    label: "花瓣",
+    description: "适合中文场景下找海报和平面参考",
+    buildUrl: (query: string) => `https://huaban.com/search?q=${encodeURIComponent(query)}`,
+  },
+  {
+    id: "behance",
+    label: "Behance",
+    description: "适合看更完整的品牌与设计项目",
+    buildUrl: (query: string) => `https://www.behance.net/search/projects?search=${encodeURIComponent(query)}`,
+  },
+  {
+    id: "dribbble",
+    label: "Dribbble",
+    description: "适合看较强视觉表达和商业风格",
+    buildUrl: (query: string) => `https://dribbble.com/search/${encodeURIComponent(query)}`,
+  },
+  {
+    id: "google-images",
+    label: "Google 图片",
+    description: "适合先快速扫一轮全网视觉方向",
+    buildUrl: (query: string) => `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(query)}`,
+  },
+] as const;
 
 type UploadAsset = {
   id?: string;
-  mimeType: string;
-  data: string;
+  mimeType?: string;
+  data?: string;
   url: string;
   name: string;
 };
@@ -112,6 +144,13 @@ function buildPersistedStorage(items: StorageItem[]) {
   return items
     .filter((item) => isPersistableStorageUrl(item.url))
     .slice(0, MAX_PERSISTED_STORAGE_ITEMS);
+}
+
+function buildAssetModelUrl(asset: UploadAsset) {
+  if (asset.data && asset.mimeType) {
+    return `data:${asset.mimeType};base64,${asset.data}`;
+  }
+  return asset.url;
 }
 
 type IdeasTaskResult = {
@@ -351,6 +390,9 @@ export default function App() {
   const [prompt, setPrompt] = useState("");
   const [styleRefImages, setStyleRefImages] = useState<UploadAsset[]>([]);
   const styleRefInputRef = useRef<HTMLInputElement>(null);
+  const [referenceSearchInput, setReferenceSearchInput] = useState("");
+  const [referenceSearchQuery, setReferenceSearchQuery] = useState("");
+  const [referenceImportUrl, setReferenceImportUrl] = useState("");
 
   const [uploadedPosters, setUploadedPosters] = useState<UploadAsset[]>([]);
   const [optimizeFeedback, setOptimizeFeedback] = useState("");
@@ -580,6 +622,18 @@ export default function App() {
     return lines.join("\n");
   };
 
+  const buildReferenceSearchQuery = () => {
+    const subject = referenceSearchInput.trim() || briefFields.subject.trim();
+    const keywords = [
+      subject,
+      briefFields.channel.trim(),
+      briefFields.tone.trim(),
+      ART_STYLES.find((style) => style.id === selectedStyle)?.label || "",
+      "poster design reference",
+    ].filter(Boolean);
+    return keywords.join(" ");
+  };
+
   const decorateGeneratedPosters = (
     nextPosters: PosterItem[],
     options: { labels?: string[]; sourceLabel: string; sourceType: PosterItem["sourceType"] },
@@ -608,6 +662,35 @@ export default function App() {
 
   const toggleFeedbackFocus = (focus: string) => {
     setFeedbackFocuses((prev) => (prev.includes(focus) ? prev.filter((item) => item !== focus) : [...prev, focus]));
+  };
+
+  const runReferenceSearch = () => {
+    const query = buildReferenceSearchQuery();
+    if (!query.trim()) {
+      setError("请先输入主体或补充简报信息，再开始参考搜索。");
+      return;
+    }
+    setReferenceSearchQuery(query);
+    setError("");
+  };
+
+  const importReferenceUrl = () => {
+    const url = referenceImportUrl.trim();
+    if (!/^https?:\/\//i.test(url)) {
+      setError("请输入有效的参考图片链接。");
+      return;
+    }
+    setStyleRefImages((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        url,
+        name: `参考链接 ${prev.length + 1}`,
+      },
+    ]);
+    setReferenceImportUrl("");
+    setNotice({ tone: "success", message: "参考图链接已加入风格参考。" });
+    setError("");
   };
 
   const comparedPosters = compareSelection
@@ -656,6 +739,59 @@ export default function App() {
       setIdeas(result.ideas);
       setSelectedIdeas([]);
       setStep(2);
+    } catch (err: any) {
+      setError(getFriendlyErrorMessage(err.message));
+      setTaskStatus("failed");
+    } finally {
+      setTaskStatus("idle");
+      setLoading(false);
+    }
+  };
+
+  const directGeneratePosters = async () => {
+    const creativeBrief = buildCreativeBrief();
+    if (!creativeBrief.trim() && !styleRefImages.length) {
+      setError("请输入需求或上传参考图");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setLoadingText(`正在根据当前需求直接生成 ${imageCount} 张海报...`);
+    setTaskStatus("queued");
+    try {
+      const result = await runTask<
+        {
+          selectedIdeas: number[];
+          ideas: string[];
+          selectedStyle: string;
+          selectedRatio: string;
+          selectedModel: string;
+          imageCount: number;
+          referenceImages: UploadAsset[];
+        },
+        PostersTaskResult
+      >(
+        "generate-posters",
+        {
+          selectedIdeas: [0],
+          ideas: [creativeBrief || prompt || briefFields.subject || "Poster design"],
+          selectedStyle,
+          selectedRatio,
+          selectedModel,
+          imageCount,
+          referenceImages: styleRefImages,
+        },
+        {
+          onStatusChange: (status) => setTaskStatus(status),
+        },
+      );
+      const generated = decorateGeneratedPosters(result.posters, {
+        labels: result.posters.map((_, index) => `直出海报-v${index + 1}`),
+        sourceLabel: "直接出图",
+        sourceType: "ideas",
+      });
+      setPosters((prev) => [...generated, ...prev]);
+      setStep(3);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
       setTaskStatus("failed");
@@ -729,6 +865,7 @@ export default function App() {
           selectedRatio: string;
           selectedModel: string;
           imageCount: number;
+          referenceImages: UploadAsset[];
         },
         PostersTaskResult
       >("generate-posters", {
@@ -738,6 +875,7 @@ export default function App() {
         selectedRatio,
         selectedModel,
         imageCount,
+        referenceImages: styleRefImages,
       }, {
         onStatusChange: (status) => setTaskStatus(status),
       });
@@ -1325,6 +1463,71 @@ export default function App() {
 
                     <div>
                       <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
+                        参考搜索
+                      </label>
+                      <div className="space-y-3 rounded-[24px] bg-[var(--surface-muted)] p-4">
+                        <div className="flex flex-col gap-3 md:flex-row">
+                          <input
+                            value={referenceSearchInput}
+                            onChange={(e) => setReferenceSearchInput(e.target.value)}
+                            placeholder="输入你要找的主体，例如：香水、咖啡机、音乐节"
+                            className="soft-input flex-1 rounded-[18px] px-4 py-3 text-sm"
+                          />
+                          <button
+                            onClick={runReferenceSearch}
+                            className="rounded-full bg-[var(--surface-strong)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)] transition hover:bg-[var(--surface-elevated)]"
+                          >
+                            搜索参考
+                          </button>
+                        </div>
+                        <p className="text-xs text-[var(--text-secondary)]">
+                          会结合主体、风格、场景生成搜索词，打开 Pinterest、花瓣、Behance 等站点供客户浏览参考。
+                        </p>
+                        {referenceSearchQuery ? (
+                          <div className="rounded-[18px] border border-[var(--border-subtle)] bg-[var(--surface-elevated)] px-4 py-3">
+                            <p className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">当前搜索词</p>
+                            <p className="mt-2 text-sm font-medium text-[var(--text-primary)]">{referenceSearchQuery}</p>
+                            <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                              {REFERENCE_SEARCH_PROVIDERS.map((provider) => (
+                                <a
+                                  key={provider.id}
+                                  href={provider.buildUrl(referenceSearchQuery)}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="rounded-[18px] border border-[var(--border-subtle)] bg-[var(--surface-muted)] px-4 py-3 transition hover:bg-[var(--surface-strong)]"
+                                >
+                                  <div className="text-sm font-semibold text-[var(--text-primary)]">{provider.label}</div>
+                                  <div className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">{provider.description}</div>
+                                </a>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                        <div className="rounded-[18px] border border-dashed border-[var(--border-subtle)] px-4 py-4">
+                          <p className="text-sm font-semibold text-[var(--text-primary)]">导入选中的参考图链接</p>
+                          <p className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">
+                            在外部搜索页找到合适图片后，把图片链接粘贴到这里，就能加入上面的风格参考，并继续用 @图 引用。
+                          </p>
+                          <div className="mt-3 flex flex-col gap-3 md:flex-row">
+                            <input
+                              value={referenceImportUrl}
+                              onChange={(e) => setReferenceImportUrl(e.target.value)}
+                              placeholder="粘贴参考图片链接，例如 https://..."
+                              className="soft-input flex-1 rounded-[18px] px-4 py-3 text-sm"
+                            />
+                            <button
+                              onClick={importReferenceUrl}
+                              className="rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white transition hover:opacity-90"
+                            >
+                              加入风格参考
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
                         项目模板
                       </label>
                       <div className="grid gap-3 md:grid-cols-2">
@@ -1413,12 +1616,20 @@ export default function App() {
                       <p className="mt-3 text-xs text-[var(--text-tertiary)]">如果赶时间，只填上面的简报字段也能直接开始。</p>
                     </div>
 
-                    <button
-                      onClick={generateIdeas}
-                      className="w-full rounded-full bg-[var(--accent-strong)] px-5 py-3.5 text-sm font-semibold text-white shadow-[var(--shadow-card)] transition hover:opacity-90"
-                    >
-                      生成 {ideaCount} 个创意方向
-                    </button>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <button
+                        onClick={generateIdeas}
+                        className="w-full rounded-full bg-[var(--accent-strong)] px-5 py-3.5 text-sm font-semibold text-white shadow-[var(--shadow-card)] transition hover:opacity-90"
+                      >
+                        生成 {ideaCount} 个创意方向
+                      </button>
+                      <button
+                        onClick={directGeneratePosters}
+                        className="w-full rounded-full bg-[var(--surface-strong)] px-5 py-3.5 text-sm font-semibold text-[var(--text-primary)] shadow-[var(--shadow-card)] transition hover:bg-[var(--surface-elevated)]"
+                      >
+                        直接出图 × {imageCount}
+                      </button>
+                    </div>
                   </div>
                 </WorkbenchCard>
 

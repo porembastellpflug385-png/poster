@@ -55,8 +55,8 @@ const RATIO_TO_MJ_AR: Record<string, string> = {
 
 type UploadAsset = {
   id?: string;
-  mimeType: string;
-  data: string;
+  mimeType?: string;
+  data?: string;
   url: string;
   name: string;
 };
@@ -84,6 +84,7 @@ type GeneratePostersPayload = {
   selectedRatio: string;
   selectedModel: string;
   imageCount?: number;
+  referenceImages?: UploadAsset[];
 };
 
 type OptimizeExistingPayload = {
@@ -151,6 +152,18 @@ function authHeaders() {
     "Content-Type": "application/json",
     Authorization: `Bearer ${API_KEY}`,
   };
+}
+
+function buildAssetUrl(asset: UploadAsset) {
+  if (asset.data && asset.mimeType) {
+    return `data:${asset.mimeType};base64,${asset.data}`;
+  }
+  return asset.url;
+}
+
+function buildMjAssetUrl(asset: UploadAsset) {
+  const url = buildAssetUrl(asset);
+  return url.startsWith("data:") ? url : null;
 }
 
 async function readErrorMessage(res: Response, fallback: string) {
@@ -357,7 +370,7 @@ ${payload.selectedStyle === "smart" && payload.styleRefImages?.length ? "根据�
     },
   ];
   payload.styleRefImages?.forEach((img) => {
-    content.push({ type: "image_url", image_url: { url: `data:${img.mimeType};base64,${img.data}` } });
+    content.push({ type: "image_url", image_url: { url: buildAssetUrl(img) } });
   });
   const res = await callTextModel([{ role: "user", content }], payload.selectedTextModel || TEXT_MODEL, {
     response_format: { type: "json_object" },
@@ -377,6 +390,11 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
   const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const posters: PosterResult[] = [];
+  const referenceImages = (payload.referenceImages || []).map((asset) => buildAssetUrl(asset));
+  const mjReferenceImages = (payload.referenceImages || [])
+    .map((asset) => buildMjAssetUrl(asset))
+    .filter(Boolean) as string[];
+  const activeReferenceImages = payload.selectedModel.startsWith("mj_") ? mjReferenceImages : referenceImages;
 
   for (const idx of payload.selectedIdeas) {
     const idea = payload.ideas[idx];
@@ -386,6 +404,7 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
           `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. High quality poster. Variation ${index + 1}.`,
           payload.selectedModel,
           payload.selectedRatio,
+          activeReferenceImages,
         ),
       ),
     );
