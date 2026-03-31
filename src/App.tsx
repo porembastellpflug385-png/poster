@@ -60,7 +60,7 @@ const ASPECT_RATIOS = [
   { id: "16:9", w: 16, h: 9, desc: "横版" },
 ];
 
-const STEPS = ["需求输入", "创意选择", "海报生成", "反馈优化", "定稿提案"];
+const STEPS = ["需求输入", "初稿生成", "逐稿反馈", "重新生成"];
 const QUICK_BRIEF_CHIPS = [
   "新品发布海报，突出高级感和品牌质感",
   "电商促销海报，强调价格与主视觉冲击",
@@ -78,6 +78,8 @@ const IDEA_COUNT_OPTIONS = [2, 4, 6] as const;
 const IMAGE_COUNT_OPTIONS = [1, 2, 3] as const;
 const STORAGE_KEY = "poster_storage";
 const MAX_PERSISTED_STORAGE_ITEMS = 24;
+const MAX_STYLE_REFERENCE_COUNT = 4;
+const MAX_TASK_PAYLOAD_BYTES = 4.5 * 1024 * 1024;
 const REFERENCE_SEARCH_PROVIDERS = [
   {
     id: "pinterest",
@@ -147,6 +149,8 @@ type PosterItem = {
   url: string;
   ideaText: string;
   timestamp: number;
+  generationStage?: "initial" | "refined";
+  fromPosterId?: string;
   batchId?: string;
   sourceLabel?: string;
   sourceType?: "ideas" | "optimize-existing" | "optimize-poster";
@@ -176,6 +180,66 @@ function buildAssetModelUrl(asset: UploadAsset) {
   return asset.url;
 }
 
+async function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("文件读取失败"));
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsDataURL(file);
+  });
+}
+
+async function compressImageFile(
+  file: File,
+  options: {
+    maxWidth: number;
+    maxHeight: number;
+    quality: number;
+    preservePng?: boolean;
+  },
+): Promise<UploadAsset> {
+  const dataUrl = await readFileAsDataUrl(file);
+  const image = await loadCanvasImage(dataUrl);
+  const scale = Math.min(1, options.maxWidth / image.width, options.maxHeight / image.height);
+  const width = Math.max(1, Math.round(image.width * scale));
+  const height = Math.max(1, Math.round(image.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    throw new Error("浏览器不支持图片压缩");
+  }
+
+  if (options.preservePng && file.type === "image/png") {
+    ctx.clearRect(0, 0, width, height);
+  } else {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+  }
+
+  ctx.drawImage(image, 0, 0, width, height);
+  const outputType = options.preservePng && file.type === "image/png" ? "image/png" : "image/jpeg";
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, outputType, options.quality));
+  if (!blob) {
+    throw new Error("图片压缩失败");
+  }
+  const compressedUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("压缩结果读取失败"));
+    reader.onload = () => resolve(reader.result as string);
+    reader.readAsDataURL(blob);
+  });
+
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    mimeType: outputType,
+    data: compressedUrl.split(",")[1],
+    url: compressedUrl,
+    name: file.name,
+  };
+}
+
 type IdeasTaskResult = {
   ideas: string[];
 };
@@ -186,6 +250,11 @@ type PostersTaskResult = {
 
 type ProposalTaskResult = {
   proposalText: string;
+};
+
+type FeedbackDraft = {
+  text: string;
+  count: (typeof IMAGE_COUNT_OPTIONS)[number];
 };
 
 type CopyLayoutMode = (typeof COPY_LAYOUT_OPTIONS)[number]["id"];
@@ -563,6 +632,8 @@ export default function App() {
     note: "",
   });
   const [prompt, setPrompt] = useState("");
+  const [productImage, setProductImage] = useState<UploadAsset | null>(null);
+  const productInputRef = useRef<HTMLInputElement>(null);
   const [styleRefImages, setStyleRefImages] = useState<UploadAsset[]>([]);
   const styleRefInputRef = useRef<HTMLInputElement>(null);
   const logoInputRef = useRef<HTMLInputElement>(null);
@@ -590,6 +661,7 @@ export default function App() {
   const [selectedIdeas, setSelectedIdeas] = useState<number[]>([]);
 
   const [posters, setPosters] = useState<PosterItem[]>([]);
+  const [feedbackDrafts, setFeedbackDrafts] = useState<Record<string, FeedbackDraft>>({});
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackFocuses, setFeedbackFocuses] = useState<string[]>([]);
   const [refImages, setRefImages] = useState<UploadAsset[]>([]);
@@ -598,6 +670,7 @@ export default function App() {
   const [compareSelection, setCompareSelection] = useState<string[]>([]);
   const [resultFilter, setResultFilter] = useState<(typeof RESULT_FILTERS)[number]["id"]>("all");
   const [latestBatchId, setLatestBatchId] = useState<string | null>(null);
+  const [latestRefinedSourceId, setLatestRefinedSourceId] = useState<string | null>(null);
 
   const [proposalText, setProposalText] = useState("");
   const [finalPoster, setFinalPoster] = useState<PosterItem | null>(null);
@@ -696,53 +769,54 @@ export default function App() {
     return item;
   }, []);
 
+  const compressUploadFile = useCallback(async (file: File, kind: "product" | "style" | "qr" | "logo") => {
+    if (!file.type.startsWith("image/")) {
+      throw new Error("仅支持上传图片文件");
+    }
+    const config =
+      kind === "product"
+        ? { maxWidth: 1600, maxHeight: 1600, quality: 0.84, preservePng: false }
+        : kind === "style"
+          ? { maxWidth: 1200, maxHeight: 1200, quality: 0.78, preservePng: false }
+          : { maxWidth: 720, maxHeight: 720, quality: 0.92, preservePng: true };
+    return compressImageFile(file, config);
+  }, []);
+
   const handleMultiAssetUpload = (
     e: React.ChangeEvent<HTMLInputElement>,
     setter: React.Dispatch<React.SetStateAction<UploadAsset[]>>,
+    kind: "style" | "qr" | "logo" | "product" = "style",
   ) => {
     const files = e.target.files ? Array.from<File>(e.target.files) : [];
-    files.forEach((file) => {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const result = reader.result as string;
-        setter((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString() + Math.random().toString(36).slice(2),
-            mimeType: file.type,
-            data: result.split(",")[1],
-            url: result,
-            name: file.name,
-          },
-        ]);
-      };
-      reader.readAsDataURL(file);
+    const allowedFiles = kind === "style" ? files.slice(0, MAX_STYLE_REFERENCE_COUNT) : files;
+    Promise.all(allowedFiles.map((file) => compressUploadFile(file, kind))).then((assets) => {
+      setter((prev) => {
+        const next = [...prev, ...assets];
+        return kind === "style" ? next.slice(0, MAX_STYLE_REFERENCE_COUNT) : next;
+      });
+      if (kind === "style" && files.length > MAX_STYLE_REFERENCE_COUNT) {
+        setNotice({ tone: "error", message: `风格参考最多保留 ${MAX_STYLE_REFERENCE_COUNT} 张。` });
+      }
+    }).catch((error: any) => {
+      setError(error?.message || "图片处理失败，请重试");
     });
     e.target.value = "";
   };
 
   const handleMultiFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    handleMultiAssetUpload(e, setRefImages);
+    handleMultiAssetUpload(e, setRefImages, "style");
   };
 
   const handleSingleAssetUpload = (
     e: React.ChangeEvent<HTMLInputElement>,
     setter: React.Dispatch<React.SetStateAction<UploadAsset | null>>,
+    kind: "product" | "qr" | "logo",
   ) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const result = reader.result as string;
-      setter({
-        id: Date.now().toString() + Math.random().toString(36).slice(2),
-        mimeType: file.type,
-        data: result.split(",")[1],
-        url: result,
-        name: file.name,
-      });
-    };
-    reader.readAsDataURL(file);
+    compressUploadFile(file, kind)
+      .then((asset) => setter(asset))
+      .catch((error: any) => setError(error?.message || "图片处理失败，请重试"));
     e.target.value = "";
   };
 
@@ -927,8 +1001,11 @@ export default function App() {
   };
 
   const getFriendlyErrorMessage = (message: string) => {
+    if (message.includes("413") || message.includes("上传内容过大")) {
+      return "上传内容过大。系统已经先做了压缩，如果仍超限，请减少风格参考数量，或换更小的图片后重试。";
+    }
     if (message.includes("Failed to fetch") || message.includes("ERR_TIMED_OUT")) {
-      return "提案请求超时了。已经切换为更稳的文本提案链路，刷新后再试一次通常就能恢复。";
+      return "请求超时了。请先重试一次；如果仍失败，优先减少参考图数量或切换更快的模型。";
     }
     if (message.includes("参考链接是网页") || message.includes("参考链接类型不支持") || message.includes("mime type is not supported")) {
       return "当前参考链接不是可直接识别的图片。系统会优先自动提取网页里的主图；如果仍失败，请改用图片直链，或把参考图保存后上传。";
@@ -995,6 +1072,13 @@ export default function App() {
       .join("\n");
   };
 
+  const assertTaskPayloadSize = (type: string, payload: unknown) => {
+    const bytes = new Blob([JSON.stringify({ type, payload })]).size;
+    if (bytes > MAX_TASK_PAYLOAD_BYTES) {
+      throw new Error("上传内容过大，已超过生成请求上限。请减少参考图数量，或使用更小的图片后重试。");
+    }
+  };
+
   const buildReferenceSearchQuery = () => {
     const subject = referenceSearchInput.trim() || briefFields.subject.trim();
     const keywords = [
@@ -1026,6 +1110,16 @@ export default function App() {
       const next = { ...prev };
       items.forEach((item) => {
         next[item.id] = cloneOverlays(baseOverlays);
+      });
+      return next;
+    });
+  };
+
+  const initializeFeedbackDrafts = (items: PosterItem[]) => {
+    setFeedbackDrafts((prev) => {
+      const next = { ...prev };
+      items.forEach((item) => {
+        next[item.id] = next[item.id] || { text: "", count: 1 };
       });
       return next;
     });
@@ -1111,6 +1205,14 @@ export default function App() {
   const editingPoster = editingPosterId ? posters.find((poster) => poster.id === editingPosterId) || null : null;
   const editingOverlays = editingPosterId ? posterOverlays[editingPosterId] || [] : [];
   const selectedOverlay = editingOverlays.find((overlay) => overlay.id === selectedOverlayId) || null;
+  const initialPosters = posters.filter((poster) => !poster.fromPosterId);
+  const refinedPosters = posters.filter((poster) => Boolean(poster.fromPosterId));
+  const refinedGroups = initialPosters
+    .map((poster) => ({
+      sourcePoster: poster,
+      results: refinedPosters.filter((item) => item.fromPosterId === poster.id),
+    }))
+    .filter((group) => group.results.length > 0);
   const filteredPosters = posters.filter((poster) => {
     if (resultFilter === "all") return true;
     if (resultFilter === "latest") return latestBatchId ? poster.batchId === latestBatchId : false;
@@ -1119,12 +1221,13 @@ export default function App() {
     return true;
   });
   const projectSummary: SummaryDataItem[] = [
-    { label: "主题", value: briefFields.subject || "未填写", emphasize: true },
-    { label: "受众", value: briefFields.audience || "未填写" },
-    { label: "场景", value: briefFields.channel || "未填写" },
-    { label: "气质", value: briefFields.tone || "未填写" },
-    { label: "当前风格", value: ART_STYLES.find((style) => style.id === selectedStyle)?.label || "未设置" },
-    { label: "当前定稿", value: finalPoster?.ideaText || "尚未选择" },
+    { label: "文字需求", value: prompt.trim() ? prompt.trim().slice(0, 24) : "未填写", emphasize: true },
+    { label: "产品图", value: productImage ? "已上传" : "未上传" },
+    { label: "风格参考", value: `${styleRefImages.length} 张` },
+    { label: "输出尺寸", value: selectedRatio },
+    { label: "海报风格", value: ART_STYLES.find((style) => style.id === selectedStyle)?.label || "未设置" },
+    { label: "初稿", value: `${initialPosters.length} 张` },
+    { label: "修改稿", value: `${refinedPosters.length} 张` },
   ];
 
   const handleOverlayPointerDown = (event: React.PointerEvent<HTMLDivElement>, posterId: string, overlayId: string) => {
@@ -1151,6 +1254,18 @@ export default function App() {
       [editingPosterId]: (prev[editingPosterId] || []).map((overlay) =>
         overlay.id === selectedOverlayId ? { ...overlay, ...patch } : overlay,
       ),
+    }));
+  };
+
+  const updateFeedbackDraft = (posterId: string, patch: Partial<FeedbackDraft>) => {
+    setFeedbackDrafts((prev) => ({
+      ...prev,
+      [posterId]: {
+        text: "",
+        count: 1,
+        ...prev[posterId],
+        ...patch,
+      },
     }));
   };
 
@@ -1200,15 +1315,28 @@ export default function App() {
 
   const directGeneratePosters = async () => {
     const creativeBrief = [buildCreativeBrief(), buildCopyPrompt()].filter(Boolean).join("\n");
-    if (!creativeBrief.trim() && !styleRefImages.length) {
-      setError("请输入需求或上传参考图");
+    if (!creativeBrief.trim() && !styleRefImages.length && !productImage) {
+      setError("请至少输入文字需求，或上传产品图 / 风格参考。");
       return;
     }
     setLoading(true);
     setError("");
-    setLoadingText(`正在使用 ${IMAGE_MODELS.find((model) => model.id === selectedModel)?.label || "当前模型"} 直接生成 ${imageCount} 张海报...`);
+    setLoadingText(`正在使用 ${IMAGE_MODELS.find((model) => model.id === selectedModel)?.label || "当前模型"} 生成 ${imageCount} 张初稿...`);
     setTaskStatus("queued");
     try {
+      const payload = {
+        selectedIdeas: [0],
+        ideas: [creativeBrief || prompt || briefFields.subject || "Poster design"],
+        selectedStyle,
+        selectedRatio,
+        selectedModel,
+        imageCount,
+        referenceImages: styleRefImages,
+        productImage,
+        copyLayoutMode,
+        copyFields,
+      };
+      assertTaskPayloadSize("generate-posters", payload);
       const result = await runTask<
         {
           selectedIdeas: number[];
@@ -1218,34 +1346,31 @@ export default function App() {
           selectedModel: string;
           imageCount: number;
           referenceImages: UploadAsset[];
+          productImage: UploadAsset | null;
           copyLayoutMode: CopyLayoutMode;
+          copyFields: CopyFields;
         },
         PostersTaskResult
       >(
         "generate-posters",
-        {
-          selectedIdeas: [0],
-          ideas: [creativeBrief || prompt || briefFields.subject || "Poster design"],
-          selectedStyle,
-          selectedRatio,
-          selectedModel,
-          imageCount,
-          referenceImages: styleRefImages,
-          copyLayoutMode,
-        },
+        payload,
         {
           onStatusChange: (status) => setTaskStatus(status),
         },
       );
       const generated = decorateGeneratedPosters(result.posters, {
-        labels: result.posters.map((_, index) => `直出海报-v${index + 1}`),
-        sourceLabel: "直接出图",
+        labels: result.posters.map((_, index) => `初稿 ${index + 1}`),
+        sourceLabel: "初稿生成",
         sourceType: "ideas",
-      });
-      setPosters((prev) => [...generated, ...prev]);
+      }).map((item) => ({ ...item, generationStage: "initial" as const }));
+      setPosters(generated);
+      setFeedbackDrafts({});
+      initializeFeedbackDrafts(generated);
       assignOverlaysToPosters(generated);
+      setLatestRefinedSourceId(null);
+      setActivePoster(generated[0] || null);
       setGenerationSnapshot(buildGenerationSnapshot("direct"));
-      setStep(3);
+      setStep(2);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
       setTaskStatus("failed");
@@ -1296,6 +1421,90 @@ export default function App() {
         summary: `${uploadedPosters.length} 张原图 · ${selectedRatio} · ${imageCount} 个优化版本`,
       });
       setStep(3);
+    } catch (err: any) {
+      setError(getFriendlyErrorMessage(err.message));
+      setTaskStatus("failed");
+    } finally {
+      setTaskStatus("idle");
+      setLoading(false);
+    }
+  };
+
+  const regeneratePoster = async (poster: PosterItem) => {
+    const draft = feedbackDrafts[poster.id] || { text: "", count: 1 as const };
+    if (!draft.text.trim()) {
+      setError("请先输入修改需求，再重新生成。");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setLoadingText(`正在基于这张初稿重新生成 ${draft.count} 个画面...`);
+    setTaskStatus("queued");
+    try {
+      const payload = {
+        activePoster: poster,
+        feedbackText: draft.text,
+        refImages: styleRefImages,
+        referenceImages: styleRefImages,
+        productImage,
+        selectedStyle,
+        selectedRatio,
+        selectedModel,
+        imageCount: draft.count,
+        fromPosterId: poster.id,
+        copyLayoutMode,
+        copyFields,
+      };
+      assertTaskPayloadSize("optimize-poster", payload);
+      const result = await runTask<
+        {
+          activePoster: PosterItem | null;
+          feedbackText: string;
+          refImages: UploadAsset[];
+          referenceImages: UploadAsset[];
+          productImage: UploadAsset | null;
+          selectedStyle: string;
+          selectedRatio: string;
+          selectedModel: string;
+          imageCount: number;
+          fromPosterId: string;
+          copyLayoutMode: CopyLayoutMode;
+          copyFields: CopyFields;
+        },
+        PostersTaskResult
+      >("optimize-poster", payload, {
+        onStatusChange: (status) => setTaskStatus(status),
+      });
+      const generated = decorateGeneratedPosters(result.posters, {
+        labels: result.posters.map((_, index) => `修改稿 ${index + 1}`),
+        sourceLabel: "修改生成",
+        sourceType: "optimize-poster",
+      }).map((item) => ({
+        ...item,
+        generationStage: "refined" as const,
+        fromPosterId: poster.id,
+      }));
+      setPosters((prev) => [...generated, ...prev]);
+      if (copyLayoutMode === "with-copy") {
+        const sourceOverlays = posterOverlays[poster.id] || buildDefaultOverlays(copyFields, qrAsset, logoAsset);
+        setPosterOverlays((prev) => {
+          const next = { ...prev };
+          generated.forEach((item) => {
+            next[item.id] = cloneOverlays(sourceOverlays);
+          });
+          return next;
+        });
+      }
+      setLatestRefinedSourceId(poster.id);
+      setGenerationSnapshot({
+        mode: "optimize-poster",
+        summary: `基于「${poster.ideaText}」修改生成 ${generated.length} 张 · ${draft.text.substring(0, 24)}`,
+      });
+      setFeedbackDrafts((prev) => ({
+        ...prev,
+        [poster.id]: { ...prev[poster.id], text: "" },
+      }));
+      setStep(4);
     } catch (err: any) {
       setError(getFriendlyErrorMessage(err.message));
       setTaskStatus("failed");
@@ -1886,403 +2095,107 @@ export default function App() {
             ) : null}
 
             {step === 1 ? (
-              <div className="grid gap-6 lg:grid-cols-2">
-                <WorkbenchCard title="从零创作" subtitle="先整理需求、风格和画幅，让模型在更明确的上下文里构思。">
+              <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+                <WorkbenchCard title="第一步 · 输入" subtitle="上传产品与风格参考，输入文字需求，再一次性决定尺寸、风格、数量和有无文案。">
                   <div className="space-y-6">
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">美术风格</label>
-                      <div className="grid grid-cols-2 gap-3 xl:grid-cols-3">
-                        {ART_STYLES.map((style) => {
-                          const Icon = style.icon;
-                          const active = selectedStyle === style.id;
-                          return (
-                            <button
-                              key={style.id}
-                              onClick={() => setSelectedStyle(style.id)}
-                              className={`rounded-[24px] border p-4 text-left transition ${
-                                active
-                                  ? "border-transparent bg-[var(--accent-soft)] text-[var(--accent-strong)]"
-                                  : "border-[var(--border-subtle)] bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
-                              }`}
-                            >
-                              <Icon size={18} />
-                              <div className="mt-4 text-sm font-semibold">{style.label}</div>
-                              <div className="mt-1 text-xs">{style.desc}</div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">画幅比例</label>
-                      <div className="grid grid-cols-3 gap-3 md:grid-cols-5">
-                        {ASPECT_RATIOS.map((ratio) => {
-                          const active = selectedRatio === ratio.id;
-                          return (
-                            <button
-                              key={ratio.id}
-                              onClick={() => setSelectedRatio(ratio.id)}
-                              className={`rounded-[22px] border px-3 py-4 transition ${
-                                active
-                                  ? "border-transparent bg-[var(--accent-soft)] text-[var(--accent-strong)]"
-                                  : "border-[var(--border-subtle)] bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
-                              }`}
-                            >
-                              <div
-                                className={`mx-auto rounded-md border-2 ${active ? "border-[var(--accent-strong)]" : "border-[var(--border-strong)]"}`}
-                                style={{
-                                  width: `${Math.max(16, (ratio.w / Math.max(ratio.w, ratio.h)) * 28)}px`,
-                                  height: `${Math.max(16, (ratio.h / Math.max(ratio.w, ratio.h)) * 28)}px`,
-                                }}
-                              />
-                              <div className="mt-3 text-sm font-semibold">{ratio.id}</div>
-                              <div className="mt-1 text-xs">{ratio.desc}</div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                        生成数量
-                      </label>
-                      <div className="grid gap-3 md:grid-cols-2">
-                        <div>
-                          <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">文案数量</p>
-                          <div className="flex gap-2">
-                            {IDEA_COUNT_OPTIONS.map((count) => (
-                              <button
-                                key={count}
-                                onClick={() => setIdeaCount(count)}
-                                className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                                  ideaCount === count
-                                    ? "bg-[var(--accent-strong)] text-white"
-                                    : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
-                                }`}
-                              >
-                                {count}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                        <div>
-                          <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">图片数量</p>
-                          <div className="flex gap-2">
-                            {IMAGE_COUNT_OPTIONS.map((count) => (
-                              <button
-                                key={count}
-                                onClick={() => setImageCount(count)}
-                                className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                                  imageCount === count
-                                    ? "bg-[var(--accent-strong)] text-white"
-                                    : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
-                                }`}
-                              >
-                                {count}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                        文案排版策略
-                      </label>
-                      <div className="grid gap-3 md:grid-cols-2">
-                        {COPY_LAYOUT_OPTIONS.map((option) => {
-                          const active = copyLayoutMode === option.id;
-                          return (
-                            <button
-                              key={option.id}
-                              onClick={() => setCopyLayoutMode(option.id)}
-                              className={`rounded-[24px] border p-4 text-left transition ${
-                                active
-                                  ? "border-transparent bg-[var(--accent-soft)]"
-                                  : "border-[var(--border-subtle)] bg-[var(--surface-muted)] hover:bg-[var(--surface-strong)]"
-                              }`}
-                            >
-                              <div className="text-sm font-semibold text-[var(--text-primary)]">{option.label}</div>
-                              <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">{option.description}</p>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {copyLayoutMode === "with-copy" ? (
-                      <div className="space-y-4 rounded-[24px] bg-[var(--surface-muted)] p-4">
-                        <div>
-                          <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                            文案排版内容
-                          </label>
-                          <div className="grid gap-3">
-                            <input
-                              value={copyFields.headline}
-                              onChange={(e) => setCopyFields((prev) => ({ ...prev, headline: e.target.value }))}
-                              placeholder="主标题"
-                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
-                            />
-                            <input
-                              value={copyFields.subheadline}
-                              onChange={(e) => setCopyFields((prev) => ({ ...prev, subheadline: e.target.value }))}
-                              placeholder="副标题"
-                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
-                            />
-                            <textarea
-                              value={copyFields.body}
-                              onChange={(e) => setCopyFields((prev) => ({ ...prev, body: e.target.value }))}
-                              placeholder="正文"
-                              className="soft-input h-28 w-full rounded-[20px] px-4 py-3 text-sm resize-none"
-                            />
-                            <input
-                              value={copyFields.note}
-                              onChange={(e) => setCopyFields((prev) => ({ ...prev, note: e.target.value }))}
-                              placeholder="备注"
-                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
-                            />
-                          </div>
-                        </div>
-                        <div className="grid gap-3 md:grid-cols-2">
-                          <button
-                            onClick={() => qrInputRef.current?.click()}
-                            className="rounded-[20px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-elevated)] px-4 py-4 text-left transition hover:bg-[var(--surface-strong)]"
-                          >
-                            <input
-                              type="file"
-                              accept="image/*"
-                              ref={qrInputRef}
-                              className="hidden"
-                              onChange={(e) => handleSingleAssetUpload(e, setQrAsset)}
-                            />
-                            <div className="text-sm font-semibold text-[var(--text-primary)]">二维码区</div>
-                            <div className="mt-1 text-xs text-[var(--text-secondary)]">{qrAsset ? qrAsset.name : "上传二维码图片"}</div>
-                          </button>
-                          <button
-                            onClick={() => logoInputRef.current?.click()}
-                            className="rounded-[20px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-elevated)] px-4 py-4 text-left transition hover:bg-[var(--surface-strong)]"
-                          >
-                            <input
-                              type="file"
-                              accept="image/*"
-                              ref={logoInputRef}
-                              className="hidden"
-                              onChange={(e) => handleSingleAssetUpload(e, setLogoAsset)}
-                            />
-                            <div className="text-sm font-semibold text-[var(--text-primary)]">Logo 区</div>
-                            <div className="mt-1 text-xs text-[var(--text-secondary)]">{logoAsset ? logoAsset.name : "上传 logo 图片"}</div>
-                          </button>
-                        </div>
-                        <p className="text-xs text-[var(--text-tertiary)]">
-                          当前模式下，背景图会预留排版安全区，文案、二维码和 logo 将在生成后作为可拖拽覆盖层进行调整。
-                        </p>
-                      </div>
-                    ) : null}
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                        风格参考
-                      </label>
-                      <button
-                        onClick={() => styleRefInputRef.current?.click()}
-                        className="flex w-full items-center gap-4 rounded-[24px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-muted)] p-4 text-left transition hover:bg-[var(--surface-strong)]"
-                      >
-                        <input
-                          type="file"
-                          accept="image/*"
-                          multiple
-                          className="hidden"
-                          ref={styleRefInputRef}
-                          onChange={(e) => handleMultiAssetUpload(e, setStyleRefImages)}
-                        />
-                        {styleRefImages.length ? (
-                          <div className="flex flex-wrap gap-3">
-                            {styleRefImages.map((img, index) => (
-                              <div key={img.id || `${img.name}-${index}`} className="relative">
-                                <img src={img.url} className="h-16 w-16 rounded-[18px] object-cover" />
-                                <span className="absolute -left-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-strong)] text-[10px] font-semibold text-white">
-                                  {index + 1}
-                                </span>
-                                <button
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    setStyleRefImages((prev) => prev.filter((item) => item.id !== img.id));
-                                  }}
-                                  className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-white"
-                                >
-                                  <X size={10} />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <>
-                            <div className="flex h-14 w-14 items-center justify-center rounded-[18px] bg-[var(--surface-strong)] text-[var(--text-secondary)]">
-                              <Upload size={18} />
-                            </div>
-                            <div>
-                              <div className="text-sm font-semibold">上传风格参考图（可多张）</div>
-                              <div className="mt-1 text-xs text-[var(--text-secondary)]">支持在描述里用 @图1、@图2 指向不同参考图</div>
-                            </div>
-                          </>
-                        )}
-                      </button>
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                        参考搜索
-                      </label>
-                      <div className="space-y-3 rounded-[24px] bg-[var(--surface-muted)] p-4">
-                        <div>
-                          <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">常用搜索模板</p>
-                          <div className="flex flex-wrap gap-2">
-                            {REFERENCE_SEARCH_TEMPLATES.map((template) => (
-                              <button
-                                key={template.id}
-                                onClick={() => applyReferenceSearchTemplate(template.id)}
-                                className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
-                                  activeReferenceTemplateId === template.id
-                                    ? "bg-[var(--accent-strong)] text-white"
-                                    : "bg-[var(--surface-strong)] text-[var(--text-secondary)] hover:bg-[var(--surface-elevated)] hover:text-[var(--text-primary)]"
-                                }`}
-                              >
-                                {template.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                        <div className="flex flex-col gap-3 md:flex-row">
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div>
+                        <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">产品图（可选，单张）</label>
+                        <button
+                          onClick={() => productInputRef.current?.click()}
+                          className="flex w-full items-center gap-4 rounded-[24px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-muted)] p-4 text-left transition hover:bg-[var(--surface-strong)]"
+                        >
                           <input
-                            value={referenceSearchInput}
-                            onChange={(e) => setReferenceSearchInput(e.target.value)}
-                            placeholder="输入你要找的主体，例如：香水、咖啡机、音乐节"
-                            className="soft-input flex-1 rounded-[18px] px-4 py-3 text-sm"
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            ref={productInputRef}
+                            onChange={(e) => handleSingleAssetUpload(e, setProductImage, "product")}
                           />
-                          <button
-                            onClick={runReferenceSearch}
-                            className="rounded-full bg-[var(--surface-strong)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)] transition hover:bg-[var(--surface-elevated)]"
-                          >
-                            搜索参考
-                          </button>
-                        </div>
-                        <p className="text-xs text-[var(--text-secondary)]">
-                          会结合主体、风格、场景生成搜索词，打开 Pinterest、花瓣、Behance 等站点供客户浏览参考。
-                        </p>
-                        {referenceSearchQuery ? (
-                          <div className="rounded-[18px] border border-[var(--border-subtle)] bg-[var(--surface-elevated)] px-4 py-3">
-                            <p className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">当前搜索词</p>
-                            <p className="mt-2 text-sm font-medium text-[var(--text-primary)]">{referenceSearchQuery}</p>
-                            <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-                              {REFERENCE_SEARCH_PROVIDERS.map((provider) => (
-                                <a
-                                  key={provider.id}
-                                  href={provider.buildUrl(referenceSearchQuery)}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="rounded-[18px] border border-[var(--border-subtle)] bg-[var(--surface-muted)] px-4 py-3 transition hover:bg-[var(--surface-strong)]"
-                                >
-                                  <div className="text-sm font-semibold text-[var(--text-primary)]">{provider.label}</div>
-                                  <div className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">{provider.description}</div>
-                                </a>
-                              ))}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div className="rounded-[18px] border border-dashed border-[var(--border-subtle)] px-4 py-4">
-                          <p className="text-sm font-semibold text-[var(--text-primary)]">导入选中的参考图链接</p>
-                          <p className="mt-1 text-xs leading-5 text-[var(--text-secondary)]">
-                            在外部搜索页找到合适图片后，把图片链接粘贴到这里，就能加入上面的风格参考，并继续用 @图 引用。
-                          </p>
-                          <div className="mt-3 flex flex-col gap-3 md:flex-row">
-                            <input
-                              value={referenceImportUrl}
-                              onChange={(e) => setReferenceImportUrl(e.target.value)}
-                              placeholder="粘贴参考图片链接，例如 https://..."
-                              className="soft-input flex-1 rounded-[18px] px-4 py-3 text-sm"
-                            />
-                            <button
-                              onClick={importReferenceUrl}
-                              className="rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white transition hover:opacity-90"
-                            >
-                              加入风格参考
-                            </button>
-                          </div>
-                          {referenceImportHint ? (
-                            <p className="mt-3 text-xs text-[var(--accent-strong)]">{referenceImportHint}</p>
-                          ) : null}
-                          <div className="mt-4 rounded-[16px] bg-[var(--surface-muted)] px-4 py-3">
-                            <p className="text-xs font-medium uppercase tracking-[0.18em] text-[var(--text-tertiary)]">导入建议</p>
-                            <div className="mt-3 space-y-2 text-xs leading-5 text-[var(--text-secondary)]">
-                              {REFERENCE_IMPORT_TIPS.map((tip) => (
-                                <p key={tip}>{tip}</p>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                        项目模板
-                      </label>
-                      <div className="grid gap-3 md:grid-cols-2">
-                        {BRIEF_TEMPLATES.map((template) => {
-                          const active = activeTemplateId === template.id;
-                          return (
-                            <button
-                              key={template.id}
-                              onClick={() => applyBriefTemplate(template.id)}
-                              className={`rounded-[24px] border p-4 text-left transition ${
-                                active
-                                  ? "border-transparent bg-[var(--accent-soft)]"
-                                  : "border-[var(--border-subtle)] bg-[var(--surface-muted)] hover:bg-[var(--surface-strong)]"
-                              }`}
-                            >
-                              <div className="flex items-center justify-between gap-3">
-                                <span className="text-sm font-semibold text-[var(--text-primary)]">{template.label}</span>
-                                {active ? (
-                                  <span className="rounded-full bg-[var(--accent-strong)] px-2.5 py-1 text-[11px] font-medium text-white">
-                                    已应用
-                                  </span>
-                                ) : null}
+                          {productImage ? (
+                            <>
+                              <img src={productImage.url} className="h-20 w-20 rounded-[18px] object-cover" />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-sm font-semibold">{productImage.name}</div>
+                                <div className="mt-1 text-xs text-[var(--text-secondary)]">已作为主体参考图</div>
                               </div>
-                              <p className="mt-2 text-xs leading-5 text-[var(--text-secondary)]">{template.description}</p>
-                            </button>
-                          );
-                        })}
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setProductImage(null);
+                                }}
+                                className="rounded-full bg-black/70 p-1.5 text-white"
+                              >
+                                <X size={12} />
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <div className="flex h-14 w-14 items-center justify-center rounded-[18px] bg-[var(--surface-strong)] text-[var(--text-secondary)]">
+                                <ImageIcon size={18} />
+                              </div>
+                              <div>
+                                <div className="text-sm font-semibold">上传产品图</div>
+                                <div className="mt-1 text-xs text-[var(--text-secondary)]">自动压缩，减少 413 风险</div>
+                              </div>
+                            </>
+                          )}
+                        </button>
                       </div>
-                      <p className="mt-3 text-xs text-[var(--text-tertiary)]">如果你不想从零开始，先点一个最接近的模板会更快。</p>
+
+                      <div>
+                        <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
+                          风格参考（可选，最多 {MAX_STYLE_REFERENCE_COUNT} 张）
+                        </label>
+                        <button
+                          onClick={() => styleRefInputRef.current?.click()}
+                          className="flex w-full items-center gap-4 rounded-[24px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-muted)] p-4 text-left transition hover:bg-[var(--surface-strong)]"
+                        >
+                          <input
+                            type="file"
+                            accept="image/*"
+                            multiple
+                            className="hidden"
+                            ref={styleRefInputRef}
+                            onChange={(e) => handleMultiAssetUpload(e, setStyleRefImages, "style")}
+                          />
+                          {styleRefImages.length ? (
+                            <div className="flex flex-wrap gap-3">
+                              {styleRefImages.map((img, index) => (
+                                <div key={img.id || `${img.name}-${index}`} className="relative">
+                                  <img src={img.url} className="h-16 w-16 rounded-[18px] object-cover" />
+                                  <span className="absolute -left-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-strong)] text-[10px] font-semibold text-white">
+                                    {index + 1}
+                                  </span>
+                                  <button
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      setStyleRefImages((prev) => prev.filter((item) => item.id !== img.id));
+                                    }}
+                                    className="absolute -right-2 -top-2 rounded-full bg-black/70 p-1 text-white"
+                                  >
+                                    <X size={10} />
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <>
+                              <div className="flex h-14 w-14 items-center justify-center rounded-[18px] bg-[var(--surface-strong)] text-[var(--text-secondary)]">
+                                <Upload size={18} />
+                              </div>
+                              <div>
+                                <div className="text-sm font-semibold">上传风格参考</div>
+                                <div className="mt-1 text-xs text-[var(--text-secondary)]">最多 4 张，会自动压缩</div>
+                              </div>
+                            </>
+                          )}
+                        </button>
+                      </div>
                     </div>
 
                     <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">
-                        创意简报
-                      </label>
-                      <div className="grid gap-3 md:grid-cols-2">
-                        {BRIEF_FIELD_META.map((field) => (
-                          <label key={field.key} className="block">
-                            <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">{field.label}</span>
-                            <input
-                              value={briefFields[field.key]}
-                              onChange={(e) => updateBriefField(field.key, e.target.value)}
-                              placeholder={field.placeholder}
-                              className="soft-input w-full rounded-[20px] px-4 py-3 text-sm"
-                            />
-                          </label>
-                        ))}
-                      </div>
-                      <p className="mt-3 text-xs text-[var(--text-tertiary)]">
-                        这 4 项填完就已经足够开始生成，下面的大文本框只做补充。
-                      </p>
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">内容描述</label>
+                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">文字需求</label>
                       <div className="mb-3 flex flex-wrap gap-2">
                         {QUICK_BRIEF_CHIPS.map((chip) => (
                           <button
@@ -2297,161 +2210,275 @@ export default function App() {
                       <textarea
                         value={prompt}
                         onChange={(e) => setPrompt(e.target.value)}
-                        placeholder="补充你还想强调的信息，例如把@图1的产品放进@图2的场景里..."
+                        placeholder="例如：新品发布海报，突出产品主体和高级感，适合小红书与官网首屏..."
                         className="soft-input h-36 w-full rounded-[24px] px-5 py-4 text-sm resize-none"
                       />
-                      {styleRefImages.length ? (
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          {styleRefImages.map((_, index) => (
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                      <div>
+                        <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">输出尺寸</label>
+                        <div className="grid grid-cols-2 gap-2">
+                          {ASPECT_RATIOS.map((ratio) => (
                             <button
-                              key={index}
-                              onClick={() => setPrompt((prev) => `${prev}@图${index + 1} `)}
-                              className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]"
+                              key={ratio.id}
+                              onClick={() => setSelectedRatio(ratio.id)}
+                              className={`rounded-[18px] px-3 py-3 text-sm font-medium transition ${
+                                selectedRatio === ratio.id
+                                  ? "bg-[var(--accent-strong)] text-white"
+                                  : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                              }`}
                             >
-                              @图{index + 1}
+                              {ratio.id}
                             </button>
                           ))}
                         </div>
-                      ) : null}
-                      <p className="mt-3 text-xs text-[var(--text-tertiary)]">如果赶时间，只填上面的简报字段也能直接开始。</p>
-                    </div>
+                      </div>
 
-                    <div className="grid gap-3 md:grid-cols-2">
-                      <button
-                        onClick={generateIdeas}
-                        className="w-full rounded-full bg-[var(--accent-strong)] px-5 py-3.5 text-sm font-semibold text-white shadow-[var(--shadow-card)] transition hover:opacity-90"
-                      >
-                        生成 {ideaCount} 个创意方向
-                      </button>
-                      <button
-                        onClick={directGeneratePosters}
-                        className="w-full rounded-full bg-[var(--surface-strong)] px-5 py-3.5 text-sm font-semibold text-[var(--text-primary)] shadow-[var(--shadow-card)] transition hover:bg-[var(--surface-elevated)]"
-                      >
-                        直接出图 × {imageCount}
-                      </button>
-                    </div>
-                  </div>
-                </WorkbenchCard>
-
-                <WorkbenchCard
-                  title="上传优化"
-                  subtitle="已有海报时，直接用当前模型生成 3 个优化方向。"
-                  accent="green"
-                >
-                  <div className="space-y-6">
-                    <button
-                      onClick={() => uploadPosterRef.current?.click()}
-                      className="flex w-full flex-col items-center justify-center rounded-[28px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-muted)] px-6 py-10 text-center transition hover:bg-[var(--surface-strong)]"
-                    >
-                      <input
-                        type="file"
-                        accept="image/*"
-                        multiple
-                        className="hidden"
-                        ref={uploadPosterRef}
-                        onChange={(e) => handleMultiAssetUpload(e, setUploadedPosters)}
-                      />
-                      {uploadedPosters.length ? (
-                        <div className="flex flex-wrap justify-center gap-3">
-                          {uploadedPosters.map((img, index) => (
-                            <div key={img.id || `${img.name}-${index}`} className="relative">
-                              <img src={img.url} className="h-24 w-24 rounded-[18px] object-cover shadow-[var(--shadow-card)]" />
-                              <span className="absolute -left-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-strong)] text-[10px] font-semibold text-white">
-                                {index + 1}
-                              </span>
-                            </div>
+                      <div>
+                        <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">海报风格</label>
+                        <div className="grid grid-cols-2 gap-2">
+                          {ART_STYLES.slice(0, 8).map((style) => (
+                            <button
+                              key={style.id}
+                              onClick={() => setSelectedStyle(style.id)}
+                              className={`rounded-[18px] px-3 py-3 text-sm font-medium transition ${
+                                selectedStyle === style.id
+                                  ? "bg-[var(--accent-strong)] text-white"
+                                  : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                              }`}
+                            >
+                              {style.label}
+                            </button>
                           ))}
                         </div>
-                      ) : (
-                        <>
-                          <Upload size={24} className="text-[var(--text-secondary)]" />
-                          <div className="mt-4 text-sm font-semibold">上传海报原图（可多张）</div>
-                          <div className="mt-1 text-xs text-[var(--text-secondary)]">支持在描述里用 @图1、@图2 做组合重构</div>
-                        </>
-                      )}
-                    </button>
+                      </div>
 
-                    <textarea
-                      value={optimizeFeedback}
-                      onChange={(e) => setOptimizeFeedback(e.target.value)}
-                      placeholder="例如：把@图1的产品，放在@图2的花园里，并整体更高级..."
-                      className="soft-input h-32 w-full rounded-[24px] px-5 py-4 text-sm resize-none"
-                    />
-                    {uploadedPosters.length ? (
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {uploadedPosters.map((_, index) => (
+                      <div>
+                        <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">生成数量</label>
+                        <div className="flex gap-2">
+                          {IMAGE_COUNT_OPTIONS.map((count) => (
+                            <button
+                              key={count}
+                              onClick={() => setImageCount(count)}
+                              className={`flex-1 rounded-[18px] px-4 py-3 text-sm font-medium transition ${
+                                imageCount === count
+                                  ? "bg-[var(--accent-strong)] text-white"
+                                  : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                              }`}
+                            >
+                              {count}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">文案模式</label>
+                        <div className="grid gap-2">
+                          {COPY_LAYOUT_OPTIONS.map((option) => (
+                            <button
+                              key={option.id}
+                              onClick={() => setCopyLayoutMode(option.id)}
+                              className={`rounded-[18px] px-3 py-3 text-left text-sm font-medium transition ${
+                                copyLayoutMode === option.id
+                                  ? "bg-[var(--accent-strong)] text-white"
+                                  : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                              }`}
+                            >
+                              {option.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    {copyLayoutMode === "with-copy" ? (
+                      <div className="space-y-4 rounded-[24px] bg-[var(--surface-muted)] p-4">
+                        <label className="block">
+                          <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">主标题</span>
+                          <input
+                            value={copyFields.headline}
+                            onChange={(e) => setCopyFields((prev) => ({ ...prev, headline: e.target.value }))}
+                            className="soft-input w-full rounded-[18px] px-4 py-3 text-sm"
+                            placeholder="输入主标题"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">副标题</span>
+                          <input
+                            value={copyFields.subheadline}
+                            onChange={(e) => setCopyFields((prev) => ({ ...prev, subheadline: e.target.value }))}
+                            className="soft-input w-full rounded-[18px] px-4 py-3 text-sm"
+                            placeholder="输入副标题"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">正文</span>
+                          <textarea
+                            value={copyFields.body}
+                            onChange={(e) => setCopyFields((prev) => ({ ...prev, body: e.target.value }))}
+                            className="soft-input h-24 w-full rounded-[18px] px-4 py-3 text-sm resize-none"
+                            placeholder="输入正文"
+                          />
+                        </label>
+                        <label className="block">
+                          <span className="mb-2 block text-sm font-medium text-[var(--text-secondary)]">备注</span>
+                          <input
+                            value={copyFields.note}
+                            onChange={(e) => setCopyFields((prev) => ({ ...prev, note: e.target.value }))}
+                            className="soft-input w-full rounded-[18px] px-4 py-3 text-sm"
+                            placeholder="输入备注"
+                          />
+                        </label>
+                        <div className="grid gap-3 md:grid-cols-2">
                           <button
-                            key={index}
-                            onClick={() => setOptimizeFeedback((prev) => `${prev}@图${index + 1} `)}
-                            className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]"
+                            onClick={() => qrInputRef.current?.click()}
+                            className="rounded-[18px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-elevated)] px-4 py-4 text-left transition hover:bg-[var(--surface-strong)]"
                           >
-                            @图{index + 1}
+                            <input type="file" accept="image/*" ref={qrInputRef} className="hidden" onChange={(e) => handleSingleAssetUpload(e, setQrAsset, "qr")} />
+                            <div className="text-sm font-semibold text-[var(--text-primary)]">二维码区</div>
+                            <div className="mt-1 text-xs text-[var(--text-secondary)]">{qrAsset ? qrAsset.name : "上传二维码"}</div>
                           </button>
-                        ))}
+                          <button
+                            onClick={() => logoInputRef.current?.click()}
+                            className="rounded-[18px] border border-dashed border-[var(--border-strong)] bg-[var(--surface-elevated)] px-4 py-4 text-left transition hover:bg-[var(--surface-strong)]"
+                          >
+                            <input type="file" accept="image/*" ref={logoInputRef} className="hidden" onChange={(e) => handleSingleAssetUpload(e, setLogoAsset, "logo")} />
+                            <div className="text-sm font-semibold text-[var(--text-primary)]">Logo 区</div>
+                            <div className="mt-1 text-xs text-[var(--text-secondary)]">{logoAsset ? logoAsset.name : "上传 logo"}</div>
+                          </button>
+                        </div>
+                        <p className="text-xs text-[var(--text-tertiary)]">生成后可继续拖拽、缩放和编辑这些文案与图片元素。</p>
                       </div>
                     ) : null}
 
                     <button
-                      onClick={optimizeExisting}
-                      disabled={!uploadedPosters.length}
-                      className={`w-full rounded-full px-5 py-3.5 text-sm font-semibold transition ${
-                        uploadedPosters.length
-                          ? "bg-[var(--success-strong)] text-white shadow-[var(--shadow-card)] hover:opacity-90"
-                          : "bg-[var(--surface-muted)] text-[var(--text-tertiary)]"
-                      }`}
+                      onClick={directGeneratePosters}
+                      className="w-full rounded-full bg-[var(--accent-strong)] px-5 py-3.5 text-sm font-semibold text-white shadow-[var(--shadow-card)] transition hover:opacity-90"
                     >
-                      直接优化出图 × {imageCount}
+                      生成初稿 × {imageCount}
                     </button>
+                  </div>
+                </WorkbenchCard>
+
+                <WorkbenchCard title="当前设置" subtitle="旧的创意方向中间层已退到次要逻辑，主流程只保留输入、初稿、逐稿反馈和重新生成。">
+                  <div className="space-y-3">
+                    {[
+                      { label: "产品图", value: productImage ? "已上传" : "未上传" },
+                      { label: "风格参考", value: `${styleRefImages.length} 张` },
+                      { label: "文字需求", value: prompt.trim() ? "已填写" : "未填写" },
+                      { label: "输出尺寸", value: selectedRatio },
+                      { label: "海报风格", value: ART_STYLES.find((style) => style.id === selectedStyle)?.label || "未设置" },
+                      { label: "生成数量", value: `${imageCount} 张` },
+                      { label: "文案模式", value: copyLayoutMode === "with-copy" ? "有文案" : "无文案" },
+                    ].map((item) => (
+                      <div key={item.label} className="flex items-center justify-between rounded-[18px] bg-[var(--surface-muted)] px-4 py-3">
+                        <span className="text-sm text-[var(--text-secondary)]">{item.label}</span>
+                        <span className="text-sm font-semibold text-[var(--text-primary)]">{item.value}</span>
+                      </div>
+                    ))}
+                    <div className="rounded-[18px] bg-[var(--surface-muted)] px-4 py-4 text-xs leading-5 text-[var(--text-secondary)]">
+                      上传内容会先在浏览器内压缩，再进入生成请求；如果仍超限，会在发送前直接提示你。
+                    </div>
                   </div>
                 </WorkbenchCard>
               </div>
             ) : null}
 
             {step === 2 ? (
-              <WorkbenchCard title="选择创意方向" subtitle="先筛方向，再出图，减少一次性等待和无效成本。">
-                {!ideas.length ? (
+              <WorkbenchCard title="第二步 · 初稿" subtitle="根据当前需求直接生成 1 到 3 张初稿。先看画面方向，再进入逐张反馈。">
+                {!initialPosters.length ? (
                   <div className="rounded-[24px] border border-dashed border-[var(--border-subtle)] px-6 py-16 text-center text-[var(--text-secondary)]">
-                    先回到步骤 1 输入需求，再生成创意方向。
+                    先在第一步输入需求并生成初稿。
                   </div>
                 ) : (
-                  <div className="space-y-6">
+                  <div className="space-y-5">
+                    {generationSnapshot ? (
+                      <div className="rounded-[24px] bg-[var(--surface-muted)] px-5 py-4 text-sm text-[var(--text-secondary)]">
+                        本轮生成摘要：{generationSnapshot.summary}
+                      </div>
+                    ) : null}
                     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                      {ideas.map((idea, index) => {
-                        const active = selectedIdeas.includes(index);
-                        return (
-                          <button
-                            key={index}
-                            onClick={() =>
-                              setSelectedIdeas((prev) => (active ? prev.filter((item) => item !== index) : [...prev, index]))
-                            }
-                            className={`rounded-[26px] border p-5 text-left transition ${
-                              active
-                                ? "border-transparent bg-[var(--accent-soft)]"
-                                : "border-[var(--border-subtle)] bg-[var(--surface-muted)] hover:bg-[var(--surface-strong)]"
-                            }`}
-                          >
-                            <div className="flex items-center justify-between">
-                              <span className="rounded-full bg-[var(--surface-strong)] px-3 py-1 text-xs font-semibold">方向 {index + 1}</span>
-                              {active ? <CheckCircle2 size={18} className="text-[var(--accent-strong)]" /> : null}
-                            </div>
-                            <p className="mt-4 line-clamp-5 text-sm leading-6 text-[var(--text-secondary)]">{idea}</p>
+                      {initialPosters.map((poster, index) => (
+                        <div key={poster.id} className="surface-card overflow-hidden rounded-[24px] border border-[var(--border-subtle)]">
+                          <button className="block w-full overflow-hidden" onClick={() => setPreviewImg(poster.url)}>
+                            {posterOverlays[poster.id]?.length ? (
+                              <PosterComposite posterUrl={poster.url} overlays={posterOverlays[poster.id]} />
+                            ) : (
+                              <img src={poster.url} className="aspect-[4/5] w-full object-cover transition duration-500 hover:scale-[1.02]" />
+                            )}
                           </button>
-                        );
-                      })}
+                          <div className="space-y-3 p-4">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="text-sm font-semibold text-[var(--text-primary)]">初稿 {index + 1}</div>
+                                <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--text-secondary)]">{poster.ideaText}</p>
+                              </div>
+                              <span className="rounded-full bg-[var(--surface-muted)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
+                                {selectedRatio}
+                              </span>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                onClick={() => {
+                                  setActivePoster(poster);
+                                  setStep(3);
+                                }}
+                                className="rounded-full bg-[var(--accent-strong)] px-3 py-2.5 text-sm font-semibold text-white"
+                              >
+                                去修改
+                              </button>
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    await downloadPosterAsset(
+                                      poster.url,
+                                      `${buildFileBaseName()}-draft-${index + 1}.png`,
+                                      posterOverlays[poster.id] || [],
+                                    );
+                                  } catch (err: any) {
+                                    setNotice({ tone: "error", message: err.message || "下载失败，请重试" });
+                                  }
+                                }}
+                                className="rounded-full bg-[var(--surface-muted)] px-3 py-2.5 text-sm font-semibold text-[var(--text-primary)]"
+                              >
+                                下载
+                              </button>
+                            </div>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => setPreviewImg(poster.url)}
+                                className="flex-1 rounded-full bg-[var(--surface-muted)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                              >
+                                <Eye size={12} className="mr-1 inline" />
+                                预览
+                              </button>
+                              {copyLayoutMode === "with-copy" && posterOverlays[poster.id]?.length ? (
+                                <button
+                                  onClick={() => openOverlayEditor(poster)}
+                                  className="flex-1 rounded-full bg-[var(--surface-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                                >
+                                  编辑文案
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
                     </div>
-
-                    <div className="flex flex-col gap-3 rounded-[24px] bg-[var(--surface-muted)] p-4 sm:flex-row sm:items-center sm:justify-between">
-                      <p className="text-sm text-[var(--text-secondary)]">已选 {selectedIdeas.length} 个创意，将生成 {selectedIdeas.length * imageCount} 张海报。</p>
+                    <div className="flex flex-wrap gap-3">
                       <button
-                        onClick={generatePosters}
-                        disabled={!selectedIdeas.length}
-                        className={`rounded-full px-5 py-3 text-sm font-semibold transition ${
-                          selectedIdeas.length
-                            ? "bg-[var(--accent-strong)] text-white shadow-[var(--shadow-card)]"
-                            : "bg-[var(--surface-strong)] text-[var(--text-tertiary)]"
-                        }`}
+                        onClick={() => setStep(3)}
+                        className="rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white"
                       >
-                        开始生成海报
+                        进入逐张反馈
+                      </button>
+                      <button
+                        onClick={() => setStep(1)}
+                        className="rounded-full bg-[var(--surface-muted)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)]"
+                      >
+                        返回调整输入
                       </button>
                     </div>
                   </div>
@@ -2460,575 +2487,286 @@ export default function App() {
             ) : null}
 
             {step === 3 ? (
-              <WorkbenchCard title="海报结果" subtitle="现在已经支持双图对比，方便快速筛掉弱版本并确认下一轮优化方向。">
-                {!posters.length ? (
+              <WorkbenchCard title="第三步 · 逐张反馈" subtitle="每张初稿下直接填写修改需求，并决定这张图要再生成 1 到 3 个版本。">
+                {!initialPosters.length ? (
                   <div className="rounded-[24px] border border-dashed border-[var(--border-subtle)] px-6 py-16 text-center text-[var(--text-secondary)]">
-                    暂无海报结果
+                    先完成初稿生成，再逐张填写修改需求。
                   </div>
                 ) : (
-                  <div className="space-y-5">
-                    <div className="flex flex-wrap gap-2">
-                      {RESULT_FILTERS.map((filter) => {
-                        const active = resultFilter === filter.id;
+                  <div className="space-y-6">
+                    <div className="rounded-[24px] bg-[var(--surface-muted)] px-5 py-4 text-sm text-[var(--text-secondary)]">
+                      修改说明支持自然语言，也可以结合风格参考用 <span className="font-semibold text-[var(--text-primary)]">@图1</span>、<span className="font-semibold text-[var(--text-primary)]">@图2</span> 做更精细的操作。
+                    </div>
+                    <div className="grid gap-5 xl:grid-cols-2">
+                      {initialPosters.map((poster, index) => {
+                        const draft = feedbackDrafts[poster.id] || { text: "", count: 1 as const };
+                        const active = activePoster?.id === poster.id;
                         return (
-                          <button
-                            key={filter.id}
-                            onClick={() => setResultFilter(filter.id)}
-                            className={`rounded-full px-4 py-2 text-xs font-medium transition ${
-                              active
-                                ? "bg-[var(--accent-strong)] text-white"
-                                : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-primary)]"
+                          <div
+                            key={poster.id}
+                            className={`surface-card rounded-[26px] border p-4 transition ${
+                              active ? "border-[var(--accent-strong)] shadow-[var(--shadow-card)]" : "border-[var(--border-subtle)]"
                             }`}
                           >
-                            {filter.label}
-                          </button>
-                        );
-                      })}
-                    </div>
-
-                    <div className="flex flex-col gap-3 rounded-[24px] bg-[var(--surface-muted)] p-4 lg:flex-row lg:items-center lg:justify-between">
-                      <div>
-                        <p className="text-sm font-semibold text-[var(--text-primary)]">结果筛选工作流</p>
-                        <p className="mt-1 text-sm text-[var(--text-secondary)]">
-                          先勾选最多 2 张进入对比，再决定继续优化或设为定稿。
-                        </p>
-                        {generationSnapshot ? (
-                          <p className="mt-2 text-xs text-[var(--text-tertiary)]">本轮生成摘要：{generationSnapshot.summary}</p>
-                        ) : null}
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => setCompareSelection([])}
-                          className="rounded-full bg-[var(--surface-strong)] px-4 py-2 text-xs font-medium text-[var(--text-primary)]"
-                        >
-                          清空对比
-                        </button>
-                        <span className="rounded-full bg-[var(--accent-soft)] px-4 py-2 text-xs font-medium text-[var(--accent-strong)]">
-                          已选 {compareSelection.length}/2
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="rounded-[24px] border border-[var(--border-subtle)] bg-[var(--surface-muted)] px-4 py-4">
-                      <p className="text-sm font-semibold text-[var(--text-primary)]">推荐操作</p>
-                      <p className="mt-1 text-sm text-[var(--text-secondary)]">
-                        {compareSelection.length === 0 && "先选 1 张你最接近目标的海报，继续优化。"}
-                        {compareSelection.length === 1 && "已经选中 1 张，可以直接继续优化，或者再选 1 张做对比。"}
-                        {compareSelection.length === 2 && "现在最适合并排比较，快速确定哪张更适合定稿。"}
-                      </p>
-                    </div>
-
-                    {comparedPosters.length > 0 ? (
-                      <div className="grid gap-4 lg:grid-cols-2">
-                        {comparedPosters.map((poster, index) => (
-                          <div key={poster.id} className="surface-card overflow-hidden rounded-[26px] p-4">
-                            <div className="mb-3 flex items-center justify-between">
-                              <span className="rounded-full bg-[var(--surface-muted)] px-3 py-1 text-xs font-medium text-[var(--text-secondary)]">
-                                对比位 {index + 1}
-                              </span>
-                              <button
-                                onClick={() => toggleComparePoster(poster.id)}
-                                className="rounded-full bg-[var(--danger-soft)] px-3 py-1.5 text-xs font-medium text-[var(--danger-strong)]"
-                              >
-                                移出
-                              </button>
-                            </div>
-                            <button className="block w-full overflow-hidden rounded-[22px]" onClick={() => setPreviewImg(poster.url)}>
-                              <img src={poster.url} className="aspect-square w-full object-cover" />
-                            </button>
-                            <p className="mt-3 truncate text-sm font-semibold">{poster.ideaText}</p>
-                            <div className="mt-2 flex items-center justify-between text-xs text-[var(--text-tertiary)]">
-                              <span>推荐先从两张里选一张继续推进</span>
-                              <button
-                                onClick={() => setPreviewImg(poster.url)}
-                                className="inline-flex items-center gap-1 rounded-full bg-[var(--surface-muted)] px-3 py-1.5 text-[var(--text-primary)]"
-                              >
-                                <Eye size={12} />
-                                预览
-                              </button>
-                            </div>
-                            <div className="mt-4 grid grid-cols-2 gap-2">
-                              <button
-                                onClick={() => {
-                                  setActivePoster(poster);
-                                  setStep(4);
-                                }}
-                                className="rounded-full bg-[var(--surface-strong)] px-3 py-2.5 text-sm font-semibold text-[var(--text-primary)]"
-                              >
-                                继续优化
-                              </button>
-                              <button
-                                onClick={() => {
-                                  setFinalPoster(poster);
-                                  setStep(5);
-                                }}
-                                className="rounded-full bg-[var(--accent-strong)] px-3 py-2.5 text-sm font-semibold text-white"
-                              >
-                                设为定稿
-                              </button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    ) : null}
-
-                    {!filteredPosters.length ? (
-                      <div className="rounded-[24px] border border-dashed border-[var(--border-subtle)] px-6 py-12 text-center text-sm text-[var(--text-secondary)]">
-                        当前筛选下没有结果，试试切换到其他视图。
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-4">
-                        {filteredPosters.map((poster) => {
-                          const selected = compareSelection.includes(poster.id);
-                          return (
-                            <div
-                              key={poster.id}
-                              className={`surface-card overflow-hidden rounded-[24px] border transition ${
-                                selected ? "border-[var(--accent-strong)]" : "border-transparent"
-                              }`}
-                            >
-                              <div className="relative">
-                                <button className="block aspect-square w-full overflow-hidden" onClick={() => setPreviewImg(poster.url)}>
-                                  <img src={poster.url} className="h-full w-full object-cover transition duration-500 hover:scale-[1.03]" />
+                            <div className="grid gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
+                              <div className="space-y-3">
+                                <button className="block w-full overflow-hidden rounded-[20px]" onClick={() => setPreviewImg(poster.url)}>
+                                  {posterOverlays[poster.id]?.length ? (
+                                    <PosterComposite posterUrl={poster.url} overlays={posterOverlays[poster.id]} />
+                                  ) : (
+                                    <img src={poster.url} className="aspect-[4/5] w-full object-cover" />
+                                  )}
                                 </button>
-                                <button
-                                  onClick={() => toggleComparePoster(poster.id)}
-                                  className={`absolute left-3 top-3 rounded-full px-3 py-1.5 text-xs font-medium shadow-[var(--shadow-card)] ${
-                                    selected
-                                      ? "bg-[var(--accent-strong)] text-white"
-                                      : "bg-black/45 text-white backdrop-blur-md"
-                                  }`}
-                                >
-                                  {selected ? "已加入对比" : "加入对比"}
-                                </button>
-                              </div>
-                              <div className="space-y-3 p-4">
-                                <div className="flex items-start justify-between gap-3">
-                                  <div className="min-w-0">
-                                    <p className="line-clamp-2 text-sm font-semibold">{poster.ideaText}</p>
-                                    <p className="mt-1 text-xs text-[var(--text-tertiary)]">先优化，再决定是否定稿</p>
-                                  </div>
-                                  <div className="flex flex-col items-end gap-1">
-                                    <span className="rounded-full bg-[var(--surface-muted)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
-                                      {poster.sourceLabel || "结果"}
-                                    </span>
-                                    {poster.batchId === latestBatchId ? (
-                                      <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent-strong)]">
-                                        本轮
-                                      </span>
-                                    ) : null}
-                                  </div>
+                                <div className="flex items-center justify-between text-xs text-[var(--text-secondary)]">
+                                  <span className="font-semibold text-[var(--text-primary)]">初稿 {index + 1}</span>
+                                  <span>{selectedRatio}</span>
                                 </div>
-                                <div className="grid grid-cols-2 gap-2">
-                                  <button
-                                    onClick={() => {
-                                      setActivePoster(poster);
-                                      setStep(4);
-                                    }}
-                                    className="rounded-full bg-[var(--surface-strong)] px-3 py-2.5 text-sm font-semibold text-[var(--text-primary)]"
-                                  >
-                                    继续优化
-                                  </button>
-                                  <button
-                                    onClick={() => {
-                                      setFinalPoster(poster);
-                                      setStep(5);
-                                    }}
-                                    className="rounded-full bg-[var(--accent-strong)] px-3 py-2.5 text-sm font-semibold text-white"
-                                  >
-                                    设为定稿
-                                  </button>
-                                </div>
-                                {copyLayoutMode === "with-copy" && posterOverlays[poster.id]?.length ? (
-                                  <button
-                                    onClick={() => openOverlayEditor(poster)}
-                                    className="w-full rounded-full bg-[var(--surface-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
-                                  >
-                                    编辑文案排版
-                                  </button>
-                                ) : null}
                                 <div className="flex gap-2">
                                   <button
                                     onClick={() => setPreviewImg(poster.url)}
                                     className="flex-1 rounded-full bg-[var(--surface-muted)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
                                   >
-                                    <Eye size={12} className="mr-1 inline" />
                                     预览
                                   </button>
+                                  {copyLayoutMode === "with-copy" && posterOverlays[poster.id]?.length ? (
+                                    <button
+                                      onClick={() => openOverlayEditor(poster)}
+                                      className="flex-1 rounded-full bg-[var(--surface-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                                    >
+                                      文案
+                                    </button>
+                                  ) : null}
+                                </div>
+                              </div>
+
+                              <div className="space-y-4">
+                                <div className="flex items-start justify-between gap-3">
+                                  <div>
+                                    <h3 className="text-base font-semibold text-[var(--text-primary)]">基于这张初稿继续细化</h3>
+                                    <p className="mt-1 text-sm text-[var(--text-secondary)]">
+                                      {poster.ideaText || "保持主体方向，按反馈重新生成。"}
+                                    </p>
+                                  </div>
+                                  {refinedGroups.some((group) => group.sourcePoster.id === poster.id) ? (
+                                    <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]">
+                                      已有修改稿
+                                    </span>
+                                  ) : null}
+                                </div>
+
+                                <div className="flex flex-wrap gap-2">
+                                  {QUICK_FEEDBACK_CHIPS.map((chip) => (
+                                    <button
+                                      key={`${poster.id}-${chip}`}
+                                      onClick={() =>
+                                        updateFeedbackDraft(poster.id, {
+                                          text: draft.text.trim()
+                                            ? `${draft.text}${draft.text.endsWith(" ") ? "" : "，"}${chip}`
+                                            : chip,
+                                        })
+                                      }
+                                      className="rounded-full bg-[var(--surface-muted)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition hover:bg-[var(--surface-strong)] hover:text-[var(--text-primary)]"
+                                    >
+                                      {chip}
+                                    </button>
+                                  ))}
+                                  {styleRefImages.map((_, refIndex) => (
+                                    <button
+                                      key={`${poster.id}-ref-${refIndex}`}
+                                      onClick={() =>
+                                        updateFeedbackDraft(poster.id, {
+                                          text: `${draft.text}${draft.text ? " " : ""}@图${refIndex + 1} `,
+                                        })
+                                      }
+                                      className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]"
+                                    >
+                                      @图{refIndex + 1}
+                                    </button>
+                                  ))}
+                                </div>
+
+                                <textarea
+                                  value={draft.text}
+                                  onChange={(e) => updateFeedbackDraft(poster.id, { text: e.target.value })}
+                                  placeholder="例如：主体更突出，背景更干净，颜色更统一，把 @图1 的产品放进当前构图里..."
+                                  className="soft-input h-36 w-full rounded-[24px] px-5 py-4 text-sm resize-none"
+                                />
+
+                                <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                                  <div>
+                                    <div className="mb-2 text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">重新生成数量</div>
+                                    <div className="flex gap-2">
+                                      {IMAGE_COUNT_OPTIONS.map((count) => (
+                                        <button
+                                          key={`${poster.id}-${count}`}
+                                          onClick={() => updateFeedbackDraft(poster.id, { count })}
+                                          className={`rounded-[16px] px-4 py-2 text-sm font-medium transition ${
+                                            draft.count === count
+                                              ? "bg-[var(--accent-strong)] text-white"
+                                              : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)]"
+                                          }`}
+                                        >
+                                          {count}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
                                   <button
-                                    onClick={() => downloadImage(poster.url, `poster-${poster.id}.png`)}
-                                    className="flex-1 rounded-full bg-[var(--surface-muted)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                                    onClick={() => {
+                                      setActivePoster(poster);
+                                      regeneratePoster(poster);
+                                    }}
+                                    disabled={!draft.text.trim()}
+                                    className={`rounded-full px-5 py-3 text-sm font-semibold transition ${
+                                      draft.text.trim()
+                                        ? "bg-[var(--accent-strong)] text-white shadow-[var(--shadow-card)]"
+                                        : "bg-[var(--surface-muted)] text-[var(--text-tertiary)]"
+                                    }`}
                                   >
-                                    <Download size={12} className="mr-1 inline" />
-                                    下载
+                                    重新生成 × {draft.count}
                                   </button>
                                 </div>
                               </div>
                             </div>
-                          );
-                        })}
-                      </div>
-                    )}
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
               </WorkbenchCard>
             ) : null}
 
             {step === 4 ? (
-              <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
-                <WorkbenchCard title="当前版本" subtitle="下一轮可把这里升级为多版本对比与分支管理。">
-                  {activePoster ? (
-                    <div className="overflow-hidden rounded-[28px] bg-[var(--surface-muted)] p-4">
-                      {posterOverlays[activePoster.id]?.length ? (
-                        <div data-overlay-stage>
-                          <PosterComposite posterUrl={activePoster.url} overlays={posterOverlays[activePoster.id]} />
-                        </div>
-                      ) : (
-                        <img
-                          src={activePoster.url}
-                          className="w-full rounded-[24px] object-cover shadow-[var(--shadow-card)]"
-                          onClick={() => setPreviewImg(activePoster.url)}
-                        />
-                      )}
-                      <div className="mt-4 flex flex-wrap gap-2">
-                        <span className="rounded-full bg-[var(--surface-strong)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)]">
-                          {activePoster.sourceLabel || "结果"}
-                        </span>
-                        {activePoster.batchId === latestBatchId ? (
-                          <span className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]">
-                            来自本轮
-                          </span>
-                        ) : null}
-                        {posterOverlays[activePoster.id]?.length ? (
-                          <button
-                            onClick={() => openOverlayEditor(activePoster)}
-                            className="rounded-full bg-[var(--surface-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-primary)]"
-                          >
-                            编辑文案排版
-                          </button>
-                        ) : null}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="rounded-[24px] border border-dashed border-[var(--border-subtle)] px-6 py-16 text-center text-[var(--text-secondary)]">
-                      先从结果区选择一张海报再继续优化。
-                    </div>
-                  )}
-                </WorkbenchCard>
-
-                <WorkbenchCard title="反馈优化" subtitle="支持上传参考图，并用 @图1 这类方式在指令中引用。">
-                  <div className="space-y-5">
-                    <div>
-                      <div className="mb-3 flex items-center justify-between">
-                        <label className="text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">参考图</label>
-                        <button
-                          onClick={() => refImgInputRef.current?.click()}
-                          className="rounded-full bg-[var(--surface-muted)] px-3 py-1.5 text-xs font-medium text-[var(--text-primary)]"
-                        >
-                          <Plus size={12} className="mr-1 inline" />
-                          添加
-                        </button>
-                        <input type="file" accept="image/*" multiple className="hidden" ref={refImgInputRef} onChange={handleMultiFileUpload} />
-                      </div>
-                      {refImages.length ? (
-                        <div className="flex flex-wrap gap-3">
-                          {refImages.map((img, index) => (
-                            <div key={img.id} className="relative">
-                              <img src={img.url} className="h-20 w-20 rounded-[18px] object-cover" />
-                              <span className="absolute -left-2 -top-2 flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent-strong)] text-xs font-semibold text-white">
-                                {index + 1}
-                              </span>
-                              <button
-                                onClick={() => setRefImages((prev) => prev.filter((item) => item.id !== img.id))}
-                                className="absolute -right-2 -top-2 rounded-full bg-[var(--danger-strong)] p-1 text-white"
-                              >
-                                <X size={10} />
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <button
-                          onClick={() => refImgInputRef.current?.click()}
-                          className="w-full rounded-[24px] border border-dashed border-[var(--border-subtle)] px-4 py-10 text-sm text-[var(--text-secondary)]"
-                        >
-                          上传参考图（可多张）
-                        </button>
-                      )}
-                    </div>
-
-                    <div>
-                      <label className="mb-3 block text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">修改意见</label>
-                      <div className="mb-3">
-                        <p className="mb-2 text-sm font-medium text-[var(--text-secondary)]">修改重点</p>
-                        <div className="flex flex-wrap gap-2">
-                          {FEEDBACK_FOCUS_OPTIONS.map((focus) => {
-                            const active = feedbackFocuses.includes(focus);
-                            return (
-                              <button
-                                key={focus}
-                                onClick={() => toggleFeedbackFocus(focus)}
-                                className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
-                                  active
-                                    ? "bg-[var(--accent-strong)] text-white"
-                                    : "bg-[var(--surface-muted)] text-[var(--text-secondary)] hover:bg-[var(--surface-strong)] hover:text-[var(--text-primary)]"
-                                }`}
-                              >
-                                {focus}
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-                      <div className="mb-3 flex flex-wrap gap-2">
-                        {QUICK_FEEDBACK_CHIPS.map((chip) => (
-                          <button
-                            key={chip}
-                            onClick={() => appendText(setFeedbackText, chip)}
-                            className="rounded-full bg-[var(--surface-muted)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition hover:bg-[var(--surface-strong)] hover:text-[var(--text-primary)]"
-                          >
-                            {chip}
-                          </button>
-                        ))}
-                      </div>
-                      <textarea
-                        value={feedbackText}
-                        onChange={(e) => setFeedbackText(e.target.value)}
-                        placeholder="例如：提高高级感，把 @图1 的主体替换进当前画面..."
-                        className="soft-input h-40 w-full rounded-[24px] px-5 py-4 text-sm resize-none"
-                      />
-                      {refImages.length ? (
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          {refImages.map((_, index) => (
-                            <button
-                              key={index}
-                              onClick={() => setFeedbackText((prev) => `${prev}@图${index + 1} `)}
-                              className="rounded-full bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent-strong)]"
-                            >
-                              @图{index + 1}
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-
-                    <button
-                      onClick={optimizePoster}
-                      disabled={!activePoster || (!feedbackText.trim() && !feedbackFocuses.length)}
-                      className={`w-full rounded-full px-5 py-3.5 text-sm font-semibold transition ${
-                        activePoster && (feedbackText.trim() || feedbackFocuses.length)
-                          ? "bg-[var(--accent-strong)] text-white shadow-[var(--shadow-card)]"
-                          : "bg-[var(--surface-muted)] text-[var(--text-tertiary)]"
-                      }`}
-                    >
-                      优化生成 × {imageCount}
-                    </button>
+              <WorkbenchCard title="第四步 · 重新生成" subtitle="每次修改都会挂在对应初稿下面，方便你快速回看这张图是从哪一版迭代出来的。">
+                {!refinedGroups.length ? (
+                  <div className="rounded-[24px] border border-dashed border-[var(--border-subtle)] px-6 py-16 text-center text-[var(--text-secondary)]">
+                    先在第三步对某张初稿填写反馈并重新生成。
                   </div>
-                </WorkbenchCard>
-              </div>
-            ) : null}
-
-            {step === 5 ? (
-              <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_400px]">
-                <WorkbenchCard title="定稿画布" subtitle="这里已经具备定稿查看、常用尺寸导出和基础交付整理。">
-                  {finalPoster ? (
-                    <div className="space-y-4">
-                      <div className="overflow-hidden rounded-[28px] bg-[var(--surface-muted)] p-4">
-                        {posterOverlays[finalPoster.id]?.length ? (
-                          <div data-overlay-stage>
-                            <PosterComposite posterUrl={finalPoster.url} overlays={posterOverlays[finalPoster.id]} />
-                          </div>
-                        ) : (
-                          <img
-                            src={finalPoster.url}
-                            className="w-full rounded-[24px] object-contain shadow-[var(--shadow-card)]"
-                            onClick={() => setPreviewImg(finalPoster.url)}
-                          />
-                        )}
+                ) : (
+                  <div className="space-y-6">
+                    {generationSnapshot ? (
+                      <div className="rounded-[24px] bg-[var(--surface-muted)] px-5 py-4 text-sm text-[var(--text-secondary)]">
+                        最近一次修改摘要：{generationSnapshot.summary}
                       </div>
-                      <div className="flex gap-3">
-                        <button
-                          onClick={async () => {
-                            try {
-                              await downloadPosterAsset(
-                                finalPoster.url,
-                                `${buildFileBaseName()}-master.png`,
-                                posterOverlays[finalPoster.id] || [],
-                              );
-                            } catch (err: any) {
-                              setNotice({ tone: "error", message: err.message || "导出失败，请重试" });
-                            }
-                          }}
-                          className="rounded-full bg-[var(--accent-strong)] px-5 py-3 text-sm font-semibold text-white"
-                        >
-                          <Download size={14} className="mr-2 inline" />
-                          下载定稿
-                        </button>
-                        <button
-                          onClick={() => copyText(buildDeliveryText(), "交付说明已复制")}
-                          className="rounded-full bg-[var(--surface-strong)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)]"
-                        >
-                          <Copy size={14} className="mr-2 inline" />
-                          复制交付说明
-                        </button>
-                        <button
-                          onClick={() => setStep(3)}
-                          className="rounded-full bg-[var(--surface-muted)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)]"
-                        >
-                          返回结果区
-                        </button>
-                        {posterOverlays[finalPoster.id]?.length ? (
-                          <button
-                            onClick={() => openOverlayEditor(finalPoster)}
-                            className="rounded-full bg-[var(--surface-elevated)] px-5 py-3 text-sm font-semibold text-[var(--text-primary)]"
-                          >
-                            编辑文案排版
-                          </button>
-                        ) : null}
-                      </div>
-
-                      <div className="rounded-[24px] bg-[var(--surface-muted)] p-4">
-                        <div className="mb-3 flex items-center justify-between">
-                          <h3 className="text-sm font-semibold">常用导出规格</h3>
-                          <span className="text-xs text-[var(--text-tertiary)]">一键生成常用交付尺寸</span>
-                        </div>
-                        <div className="mb-3 rounded-[18px] bg-[var(--surface-strong)] px-4 py-3 text-xs leading-5 text-[var(--text-secondary)]">
-                          导出时会按目标尺寸等比缩放原图，并自动补白，不会强行裁切主体。
-                        </div>
-                        <div className="grid gap-2 sm:grid-cols-3">
-                          {EXPORT_PRESETS.map((preset) => (
-                            <button
-                              key={preset.id}
-                              onClick={async () => {
-                                try {
-                                  await downloadPosterAsset(
-                                    finalPoster.url,
-                                    `${buildFileBaseName()}-${preset.suffix}.png`,
-                                    posterOverlays[finalPoster.id] || [],
-                                    preset,
-                                  );
-                                } catch (err: any) {
-                                  setNotice({ tone: "error", message: err.message || "导出失败，请重试" });
-                                }
-                              }}
-                              className="rounded-[20px] bg-[var(--surface-strong)] px-4 py-3 text-left transition hover:bg-white"
-                            >
-                              <div className="text-sm font-semibold text-[var(--text-primary)]">{preset.label}</div>
-                              <div className="mt-1 text-xs text-[var(--text-secondary)]">
-                                {preset.width} × {preset.height}
-                              </div>
-                              <div className="mt-2 text-xs leading-5 text-[var(--text-tertiary)]">{preset.usage}</div>
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div className="rounded-[24px] bg-[var(--surface-muted)] p-4">
-                        <div className="mb-3 flex items-center justify-between">
-                          <h3 className="text-sm font-semibold">交付清单</h3>
-                          <span className="text-xs text-[var(--text-tertiary)]">当前版本的基础交付内容</span>
-                        </div>
-                        <div className="grid gap-2 sm:grid-cols-2">
-                          <div className="rounded-[20px] bg-[var(--surface-strong)] px-4 py-3">
-                            <div className="text-sm font-semibold">定稿图</div>
-                            <div className="mt-1 text-xs text-[var(--text-secondary)]">原始定稿 PNG 与常用尺寸导出</div>
-                          </div>
-                          <div className="rounded-[20px] bg-[var(--surface-strong)] px-4 py-3">
-                            <div className="text-sm font-semibold">提案说明</div>
-                            <div className="mt-1 text-xs text-[var(--text-secondary)]">设计理念、传播策略与应用建议</div>
-                          </div>
-                        </div>
-                        <div className="mt-3 rounded-[18px] bg-[var(--surface-strong)] px-4 py-3 text-xs leading-5 text-[var(--text-secondary)]">
-                          推荐交付顺序：先下载定稿主文件，再按渠道导出规格图，最后复制交付说明发给客户或同事。
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="rounded-[24px] border border-dashed border-[var(--border-subtle)] px-6 py-16 text-center text-[var(--text-secondary)]">
-                      先在结果区标记一张定稿海报。
-                    </div>
-                  )}
-                </WorkbenchCard>
-
-                <WorkbenchCard title="提案输出" subtitle="仍保留原有提案生成逻辑，界面改成更像交付面板。">
-                  {!proposalText ? (
-                    <div className="rounded-[24px] bg-[var(--surface-muted)] p-6 text-center">
-                      <FileText className="mx-auto text-[var(--text-secondary)]" size={32} />
-                      <p className="mt-4 text-base font-semibold">生成专业提案说明</p>
-                      <p className="mt-2 text-sm text-[var(--text-secondary)]">自动输出设计理念、视觉分析、传播策略与优化方向。</p>
-                      <button
-                        onClick={generateProposal}
-                        disabled={!finalPoster}
-                        className={`mt-6 rounded-full px-5 py-3 text-sm font-semibold transition ${
-                          finalPoster
-                            ? "bg-[var(--accent-strong)] text-white shadow-[var(--shadow-card)]"
-                            : "bg-[var(--surface-strong)] text-[var(--text-tertiary)]"
+                    ) : null}
+                    {refinedGroups.map((group, groupIndex) => (
+                      <div
+                        key={group.sourcePoster.id}
+                        className={`rounded-[28px] border p-4 md:p-5 ${
+                          latestRefinedSourceId === group.sourcePoster.id
+                            ? "border-[var(--accent-strong)] bg-[var(--accent-soft)]/30"
+                            : "border-[var(--border-subtle)] bg-[var(--surface-muted)]"
                         }`}
                       >
-                        生成提案
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="rounded-[24px] bg-[var(--surface-muted)] p-5">
-                      <div className="mb-4 flex items-center justify-between">
-                        <h3 className="text-base font-semibold">提案内容</h3>
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => copyText(proposalText, "提案内容已复制")}
-                            className="rounded-full bg-[var(--surface-strong)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
-                          >
-                            <Copy size={12} className="mr-1 inline" />
-                            复制提案
-                          </button>
-                          <button
-                            onClick={() => copyText(buildDeliveryText(), "交付说明已复制")}
-                            className="rounded-full bg-[var(--accent-soft)] px-3 py-2 text-xs font-medium text-[var(--accent-strong)]"
-                          >
-                            <Copy size={12} className="mr-1 inline" />
-                            复制交付说明
-                          </button>
+                        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <div className="text-xs font-medium uppercase tracking-[0.2em] text-[var(--text-tertiary)]">来源初稿 {groupIndex + 1}</div>
+                            <h3 className="mt-2 text-lg font-semibold text-[var(--text-primary)]">{group.sourcePoster.ideaText}</h3>
+                          </div>
+                          <div className="flex gap-2">
+                            {latestRefinedSourceId === group.sourcePoster.id ? (
+                              <span className="rounded-full bg-[var(--accent-strong)] px-3 py-1.5 text-xs font-medium text-white">最新一组</span>
+                            ) : null}
+                            <button
+                              onClick={() => {
+                                setActivePoster(group.sourcePoster);
+                                setStep(3);
+                              }}
+                              className="rounded-full bg-[var(--surface-elevated)] px-4 py-2 text-xs font-medium text-[var(--text-primary)]"
+                            >
+                              再改这张
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
+                          <div className="space-y-3">
+                            <button className="block w-full overflow-hidden rounded-[20px]" onClick={() => setPreviewImg(group.sourcePoster.url)}>
+                              {posterOverlays[group.sourcePoster.id]?.length ? (
+                                <PosterComposite posterUrl={group.sourcePoster.url} overlays={posterOverlays[group.sourcePoster.id]} />
+                              ) : (
+                                <img src={group.sourcePoster.url} className="aspect-[4/5] w-full object-cover" />
+                              )}
+                            </button>
+                            <div className="rounded-[18px] bg-[var(--surface-elevated)] px-4 py-3 text-xs leading-5 text-[var(--text-secondary)]">
+                              这张是原始初稿，右侧是根据该初稿反馈重新生成的版本。
+                            </div>
+                          </div>
+
+                          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                            {group.results.map((poster, index) => (
+                              <div key={poster.id} className="surface-card overflow-hidden rounded-[24px] border border-[var(--border-subtle)]">
+                                <button className="block w-full overflow-hidden" onClick={() => setPreviewImg(poster.url)}>
+                                  {posterOverlays[poster.id]?.length ? (
+                                    <PosterComposite posterUrl={poster.url} overlays={posterOverlays[poster.id]} />
+                                  ) : (
+                                    <img src={poster.url} className="aspect-[4/5] w-full object-cover transition duration-500 hover:scale-[1.02]" />
+                                  )}
+                                </button>
+                                <div className="space-y-3 p-4">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <div className="text-sm font-semibold text-[var(--text-primary)]">修改稿 {index + 1}</div>
+                                      <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--text-secondary)]">{poster.ideaText}</p>
+                                    </div>
+                                    <span className="rounded-full bg-[var(--surface-muted)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
+                                      {poster.sourceLabel || "修改生成"}
+                                    </span>
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <button
+                                      onClick={() => {
+                                        setActivePoster(group.sourcePoster);
+                                        setStep(3);
+                                      }}
+                                      className="rounded-full bg-[var(--surface-muted)] px-3 py-2.5 text-sm font-semibold text-[var(--text-primary)]"
+                                    >
+                                      再修改
+                                    </button>
+                                    <button
+                                      onClick={async () => {
+                                        try {
+                                          await downloadPosterAsset(
+                                            poster.url,
+                                            `${buildFileBaseName()}-refined-${index + 1}.png`,
+                                            posterOverlays[poster.id] || [],
+                                          );
+                                        } catch (err: any) {
+                                          setNotice({ tone: "error", message: err.message || "下载失败，请重试" });
+                                        }
+                                      }}
+                                      className="rounded-full bg-[var(--accent-strong)] px-3 py-2.5 text-sm font-semibold text-white"
+                                    >
+                                      下载
+                                    </button>
+                                  </div>
+                                  <div className="flex gap-2">
+                                    <button
+                                      onClick={() => setPreviewImg(poster.url)}
+                                      className="flex-1 rounded-full bg-[var(--surface-muted)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                                    >
+                                      预览
+                                    </button>
+                                    {copyLayoutMode === "with-copy" && posterOverlays[poster.id]?.length ? (
+                                      <button
+                                        onClick={() => openOverlayEditor(poster)}
+                                        className="flex-1 rounded-full bg-[var(--surface-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]"
+                                      >
+                                        编辑文案
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       </div>
-                      <div className="max-h-[520px] overflow-y-auto text-sm leading-7 text-[var(--text-secondary)]">
-                        {proposalText.split("\n").map((line, index) => (
-                          <p key={index} className={line.startsWith("#") || line.startsWith("**") ? "font-semibold text-[var(--text-primary)]" : ""}>
-                            {line || "\u00A0"}
-                          </p>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="mt-4 rounded-[24px] bg-[var(--surface-muted)] p-4">
-                    <h3 className="text-sm font-semibold">交付建议</h3>
-                    <ul className="mt-3 space-y-2 text-sm text-[var(--text-secondary)]">
-                      <li>先导出原始定稿，再根据投放平台选择最贴近的规格版本。</li>
-                      <li>复制交付说明时，会自动带上项目背景、交付内容和提案正文。</li>
-                      <li>如果需要发给客户或同事，优先使用“复制交付说明”配合定稿图一起发送。</li>
-                    </ul>
+                    ))}
                   </div>
-
-                  <div className="mt-4 flex gap-3">
-                    <button
-                      onClick={() => {
-                        setProposalText("");
-                        generateProposal();
-                      }}
-                      disabled={!finalPoster}
-                      className="flex-1 rounded-full bg-[var(--surface-muted)] px-4 py-3 text-sm font-semibold text-[var(--text-primary)]"
-                    >
-                      <RefreshCw size={14} className="mr-2 inline" />
-                      重新生成
-                    </button>
-                    <button
-                      onClick={() => setStep(3)}
-                      className="flex-1 rounded-full bg-[var(--surface-muted)] px-4 py-3 text-sm font-semibold text-[var(--text-primary)]"
-                    >
-                      返回结果区
-                    </button>
-                  </div>
-                </WorkbenchCard>
-              </div>
+                )}
+              </WorkbenchCard>
             ) : null}
           </section>
         </main>

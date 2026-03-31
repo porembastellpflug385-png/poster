@@ -1,5 +1,10 @@
 export const config = {
   runtime: "nodejs",
+  api: {
+    bodyParser: {
+      sizeLimit: "6mb",
+    },
+  },
 };
 
 const RAW_BASE_URL = process.env.POSTER_API_BASE_URL || process.env.OPENAI_BASE_URL || "https://ai.scd666.com";
@@ -84,8 +89,15 @@ type GeneratePostersPayload = {
   selectedRatio: string;
   selectedModel: string;
   imageCount?: number;
+  productImage?: UploadAsset | null;
   referenceImages?: UploadAsset[];
   copyLayoutMode?: "with-copy" | "without-copy";
+  copyFields?: {
+    headline?: string;
+    subheadline?: string;
+    body?: string;
+    note?: string;
+  };
 };
 
 type OptimizeExistingPayload = {
@@ -101,10 +113,20 @@ type OptimizePosterPayload = {
   activePoster: PosterResult | null;
   feedbackText: string;
   refImages: UploadAsset[];
+  referenceImages?: UploadAsset[];
+  productImage?: UploadAsset | null;
   selectedStyle: string;
   selectedRatio: string;
   selectedModel: string;
   imageCount?: number;
+  fromPosterId?: string;
+  copyLayoutMode?: "with-copy" | "without-copy";
+  copyFields?: {
+    headline?: string;
+    subheadline?: string;
+    body?: string;
+    note?: string;
+  };
 };
 
 type GenerateProposalPayload = {
@@ -230,6 +252,24 @@ async function buildReferenceAssetUrl(asset: UploadAsset) {
   }
 
   return asset.url;
+}
+
+function summarizeCopyFields(
+  copyFields?: {
+    headline?: string;
+    subheadline?: string;
+    body?: string;
+    note?: string;
+  },
+) {
+  if (!copyFields) return "";
+  const parts = [
+    copyFields.headline ? `headline: ${copyFields.headline}` : "",
+    copyFields.subheadline ? `subheadline: ${copyFields.subheadline}` : "",
+    copyFields.body ? `body: ${copyFields.body}` : "",
+    copyFields.note ? `note: ${copyFields.note}` : "",
+  ].filter(Boolean);
+  return parts.length ? `Copy content for editable overlays: ${parts.join(" | ")}.` : "";
 }
 
 async function readErrorMessage(res: Response, fallback: string) {
@@ -460,22 +500,32 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
   const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const posters: PosterResult[] = [];
+  const resolvedProductImage = payload.productImage ? await buildReferenceAssetUrl(payload.productImage) : null;
   const referenceImages = await Promise.all((payload.referenceImages || []).map((asset) => buildReferenceAssetUrl(asset)));
+  const combinedReferenceImages = [resolvedProductImage, ...referenceImages].filter(Boolean) as string[];
+  const mjCombinedReferenceImages = [
+    payload.productImage ? buildMjAssetUrl(payload.productImage) : null,
+    ...(payload.referenceImages || []).map((asset) => buildMjAssetUrl(asset)),
+  ].filter(Boolean) as string[];
   const mjReferenceImages = (payload.referenceImages || [])
     .map((asset) => buildMjAssetUrl(asset))
     .filter(Boolean) as string[];
-  const activeReferenceImages = payload.selectedModel.startsWith("mj_") ? mjReferenceImages : referenceImages;
+  const activeReferenceImages = payload.selectedModel.startsWith("mj_") ? mjCombinedReferenceImages : combinedReferenceImages;
   const copyInstruction =
     payload.copyLayoutMode === "with-copy"
       ? "Reserve clean, professional copy-safe areas for editable headline, subheadline, body, note, logo and QR placements. Do not render any legible text, letters, numbers, watermarks or logos into the background image itself."
       : "Do not include any letters, words, numbers, logos, watermarks, signage or readable typography anywhere in the image.";
+  const productInstruction = resolvedProductImage
+    ? "Treat the uploaded product image as the main subject. Preserve its core shape, material cues and brand silhouette."
+    : "";
+  const copyFieldsInstruction = summarizeCopyFields(payload.copyFields);
 
   for (const idx of payload.selectedIdeas) {
     const idea = payload.ideas[idx];
     const variants = await Promise.all(
       Array.from({ length: imageCount }, (_, index) =>
         generateImage(
-          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${copyInstruction} High quality poster. Variation ${index + 1}.`,
+          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${productInstruction} ${copyInstruction} ${copyFieldsInstruction} High quality poster. Variation ${index + 1}.`,
           payload.selectedModel,
           payload.selectedRatio,
           activeReferenceImages,
@@ -544,11 +594,33 @@ async function runOptimizePosterTask(payload: OptimizePosterPayload) {
       referenced.push(payload.refImages[index]);
     }
   }
-  const imageUrls = [payload.activePoster.url, ...referenced.map((img) => `data:${img.mimeType};base64,${img.data}`)];
-  const basePrompt = `Optimize this poster: "${payload.feedbackText}". ${stylePrompt} Ratio: ${payload.selectedRatio}. Apply changes.`;
+  const resolvedExplicitRefs = await Promise.all(
+    (payload.referenceImages || []).map((asset) => buildReferenceAssetUrl(asset)),
+  );
+  const resolvedMentionedRefs = await Promise.all(referenced.map((asset) => buildReferenceAssetUrl(asset)));
+  const resolvedProductImage = payload.productImage ? await buildReferenceAssetUrl(payload.productImage) : null;
+  const referenceSet = Array.from(
+    new Set(
+      [
+        payload.activePoster.url,
+        resolvedProductImage,
+        ...resolvedExplicitRefs,
+        ...resolvedMentionedRefs,
+      ].filter(Boolean) as string[],
+    ),
+  );
+  const copyInstruction =
+    payload.copyLayoutMode === "with-copy"
+      ? "Keep clean editable copy-safe areas in the composition. Do not burn real text, logos, QR codes or readable typography into the background image."
+      : "Do not include any readable text, numbers, logos, watermarks or signage in the regenerated image.";
+  const productInstruction = resolvedProductImage
+    ? "Use the uploaded product image as a key subject reference while applying the requested modifications."
+    : "";
+  const copyFieldsInstruction = summarizeCopyFields(payload.copyFields);
+  const basePrompt = `Optimize this poster based on the feedback: "${payload.feedbackText}". ${stylePrompt} Ratio: ${payload.selectedRatio}. ${productInstruction} ${copyInstruction} ${copyFieldsInstruction} Apply the changes clearly while preserving the strongest parts of the current layout.`;
   const results = await Promise.all(
     Array.from({ length: imageCount }, (_, index) =>
-      generateImage(`${basePrompt} Variation ${index + 1}.`, payload.selectedModel, payload.selectedRatio, imageUrls),
+      generateImage(`${basePrompt} Variation ${index + 1}.`, payload.selectedModel, payload.selectedRatio, referenceSet),
     ),
   );
 
@@ -651,6 +723,15 @@ export default async function handler(req: any, res: any) {
   if (!type) {
     res.status(400).json({ error: "缺少任务类型" });
     return;
+  }
+  try {
+    const approxBytes = Buffer.byteLength(JSON.stringify(body || {}), "utf8");
+    if (approxBytes > 6 * 1024 * 1024) {
+      res.status(413).json({ error: "上传内容过大，请减少参考图数量，或使用更小的图片后重试。", type });
+      return;
+    }
+  } catch {
+    // ignore size estimation failures
   }
 
   try {
