@@ -12,6 +12,7 @@ const API_KEY = process.env.POSTER_API_KEY || process.env.OPENAI_API_KEY || "";
 const TEXT_MODEL = process.env.POSTER_TEXT_MODEL || "deepseek-v3.2-exp";
 const DEFAULT_IDEA_COUNT = Number(process.env.POSTER_IDEA_COUNT || 6);
 const DEFAULT_IMAGE_COUNT = Number(process.env.POSTER_IMAGE_COUNT || 3);
+const DEFAULT_IMAGE_LONG_EDGE = 2048;
 
 const MODEL_ENDPOINT_MAP: Record<string, { type: "openai_chat" | "mj" | "flux"; endpoint: string }> = {
   "gemini-3.1-flash-image-preview": { type: "openai_chat", endpoint: "/v1/chat/completions" },
@@ -42,12 +43,14 @@ const STYLE_PROMPTS: Record<string, string> = {
   smart: "",
 };
 
+// Default poster output resolution is 2K.
+// We keep the long edge at 2048px and derive the matching short edge by ratio.
 const RATIO_TO_SIZE: Record<string, { width: number; height: number }> = {
-  "9:16": { width: 720, height: 1280 },
-  "3:4": { width: 768, height: 1024 },
-  "1:1": { width: 1024, height: 1024 },
-  "4:3": { width: 1024, height: 768 },
-  "16:9": { width: 1280, height: 720 },
+  "9:16": { width: 1152, height: DEFAULT_IMAGE_LONG_EDGE },
+  "3:4": { width: 1536, height: DEFAULT_IMAGE_LONG_EDGE },
+  "1:1": { width: DEFAULT_IMAGE_LONG_EDGE, height: DEFAULT_IMAGE_LONG_EDGE },
+  "4:3": { width: DEFAULT_IMAGE_LONG_EDGE, height: 1536 },
+  "16:9": { width: DEFAULT_IMAGE_LONG_EDGE, height: 1152 },
 };
 
 const RATIO_TO_MJ_AR: Record<string, string> = {
@@ -270,6 +273,11 @@ function summarizeCopyFields(
     copyFields.note ? `note: ${copyFields.note}` : "",
   ].filter(Boolean);
   return parts.length ? `Copy content for editable overlays: ${parts.join(" | ")}.` : "";
+}
+
+function buildResolutionInstruction(ratio: string) {
+  const size = RATIO_TO_SIZE[ratio] || RATIO_TO_SIZE["1:1"];
+  return `Target final poster resolution: ${size.width}x${size.height} (2K default output).`;
 }
 
 async function readErrorMessage(res: Response, fallback: string) {
@@ -498,6 +506,7 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
     throw new Error("请选择创意");
   }
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const resolutionInstruction = buildResolutionInstruction(payload.selectedRatio);
   const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const posters: PosterResult[] = [];
   const resolvedProductImage = payload.productImage ? await buildReferenceAssetUrl(payload.productImage) : null;
@@ -525,7 +534,7 @@ async function runGeneratePostersTask(payload: GeneratePostersPayload) {
     const variants = await Promise.all(
       Array.from({ length: imageCount }, (_, index) =>
         generateImage(
-          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${productInstruction} ${copyInstruction} ${copyFieldsInstruction} High quality poster. Variation ${index + 1}.`,
+          `${idea}. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${resolutionInstruction} ${productInstruction} ${copyInstruction} ${copyFieldsInstruction} High quality poster. Variation ${index + 1}.`,
           payload.selectedModel,
           payload.selectedRatio,
           activeReferenceImages,
@@ -551,12 +560,13 @@ async function runOptimizeExistingTask(payload: OptimizeExistingPayload) {
     throw new Error("请上传海报");
   }
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const resolutionInstruction = buildResolutionInstruction(payload.selectedRatio);
   const imageUrls = payload.uploadedPosters.map((img) => `data:${img.mimeType};base64,${img.data}`);
   const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const results = await Promise.all(
     Array.from({ length: imageCount }, (_, index) =>
       generateImage(
-        `Redesign and optimize this poster. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${
+        `Redesign and optimize this poster. ${stylePrompt} Aspect ratio: ${payload.selectedRatio}. ${resolutionInstruction} ${
           payload.optimizeFeedback || "Make it more professional and visually striking."
         } Variation ${index + 1}.`,
         payload.selectedModel,
@@ -584,6 +594,7 @@ async function runOptimizePosterTask(payload: OptimizePosterPayload) {
     throw new Error("请输入反馈");
   }
   const stylePrompt = STYLE_PROMPTS[payload.selectedStyle] || "";
+  const resolutionInstruction = buildResolutionInstruction(payload.selectedRatio);
   const imageCount = [1, 2, 3].includes(payload.imageCount || 0) ? payload.imageCount! : DEFAULT_IMAGE_COUNT;
   const referenced: UploadAsset[] = [];
   const regex = /@图\s*(\d+)/g;
@@ -617,7 +628,7 @@ async function runOptimizePosterTask(payload: OptimizePosterPayload) {
     ? "Use the uploaded product image as a key subject reference while applying the requested modifications."
     : "";
   const copyFieldsInstruction = summarizeCopyFields(payload.copyFields);
-  const basePrompt = `Optimize this poster based on the feedback: "${payload.feedbackText}". ${stylePrompt} Ratio: ${payload.selectedRatio}. ${productInstruction} ${copyInstruction} ${copyFieldsInstruction} Apply the changes clearly while preserving the strongest parts of the current layout.`;
+  const basePrompt = `Optimize this poster based on the feedback: "${payload.feedbackText}". ${stylePrompt} Ratio: ${payload.selectedRatio}. ${resolutionInstruction} ${productInstruction} ${copyInstruction} ${copyFieldsInstruction} Apply the changes clearly while preserving the strongest parts of the current layout.`;
   const results = await Promise.all(
     Array.from({ length: imageCount }, (_, index) =>
       generateImage(`${basePrompt} Variation ${index + 1}.`, payload.selectedModel, payload.selectedRatio, referenceSet),
